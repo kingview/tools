@@ -25,7 +25,7 @@ PLATFORM_CATALOG: tuple[PlatformDefinition, ...] = (
     PlatformDefinition(
         key="xiaohongshu",
         display_name="小红书",
-        domains=("xiaohongshu.com", "xhslink.com"),
+        domains=("xiaohongshu.com", "xhslink.com", "xhslink.cn"),
         extractor="XiaoHongShu",
         content_types=("视频", "图片"),
     ),

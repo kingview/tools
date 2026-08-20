@@ -581,6 +581,7 @@ def extract_post_url(value: str) -> str:
         "iesdouyin.com",
         "v.douyin.com",
         "xhslink.com",
+        "xhslink.cn",
         "xiaohongshu.com",
     }
     if parsed.scheme.lower() == "http" and any(

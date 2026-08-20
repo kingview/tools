@@ -11,6 +11,9 @@ from yt_dlp.utils import DownloadError
 from social_content_crawler.backend import (
     YtDlpBackend,
     _extract_douyin_play_url,
+    _extract_douyin_video_id,
+    _download_filter,
+    _download_error_message,
     _format_selector,
     _strip_audio_tracks,
     normalize_extractor_url,
@@ -116,6 +119,100 @@ def test_xiaohongshu_enables_image_post_download(monkeypatch, tmp_path: Path) ->
     assert captured["writethumbnail"] is True
     assert captured["write_all_thumbnails"] is True
     assert captured["ignore_no_formats_error"] is True
+
+
+def test_xiaohongshu_cn_shortlink_enables_image_post_download(monkeypatch, tmp_path: Path) -> None:
+    captured = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, url, download):
+            return {"id": "note-cn", "extractor_key": "XiaoHongShu", "webpage_url": url}
+
+        def sanitize_info(self, info):
+            return dict(info)
+
+    monkeypatch.setattr("social_content_crawler.backend.yt_dlp.YoutubeDL", FakeYoutubeDL)
+    YtDlpBackend().run(DownloadInput(urls=["https://xhslink.cn/o/ABC123"]), tmp_path)
+
+    assert captured["writethumbnail"] is True
+    assert captured["write_all_thumbnails"] is True
+    assert captured["ignore_no_formats_error"] is True
+
+
+def test_xiaohongshu_image_post_retries_without_video_download(
+    monkeypatch, tmp_path: Path
+) -> None:
+    attempts = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def close(self):
+            return None
+
+        def extract_info(self, url, download):
+            attempts.append((self.options["skip_download"], download))
+            if not self.options["skip_download"]:
+                raise DownloadError("No video formats found!")
+            return {
+                "id": "image-note",
+                "extractor_key": "XiaoHongShu",
+                "webpage_url": url,
+                "thumbnails": [{"url": "https://sns-webpic.xhscdn.com/image.jpg"}],
+            }
+
+        def sanitize_info(self, info):
+            return dict(info)
+
+    monkeypatch.setattr("social_content_crawler.backend.yt_dlp.YoutubeDL", FakeYoutubeDL)
+    items = YtDlpBackend().run(
+        DownloadInput(urls=["https://xhslink.cn/o/ABC123"]),
+        tmp_path,
+    )
+
+    assert attempts == [(False, True), (True, True)]
+    assert items[0]["id"] == "image-note"
+
+
+def test_xiaohongshu_download_keeps_only_original_images() -> None:
+    info = {
+        "extractor_key": "XiaoHongShu",
+        "thumbnails": [
+            {"id": "0", "url": "https://img/first!nd_prv_wlteh_jpg_3"},
+            {"id": "1", "url": "https://img/first!nd_dft_wlteh_jpg_3"},
+            {"id": "2", "url": "https://img/second!nd_prv_wlteh_jpg_3"},
+            {"id": "3", "url": "https://img/second!nd_dft_wlteh_jpg_3"},
+        ],
+    }
+
+    assert _download_filter(3600)(info) is None
+    assert [item["id"] for item in info["thumbnails"]] == ["1", "3"]
+    assert info["thumbnail"].endswith("second!nd_dft_wlteh_jpg_3")
+
+
+def test_twitter_no_video_error_is_explained_in_chinese() -> None:
+    message = _download_error_message(
+        DownloadError("ERROR: [twitter] 123: No video could be found in this tweet")
+    )
+
+    assert "没有可公开下载的视频" in message
+    assert "私密" in message
 
 
 def test_normalizes_douyin_jingxuan_modal_url() -> None:
@@ -312,3 +409,4 @@ def test_extracts_douyin_public_page_play_url() -> None:
     assert _extract_douyin_play_url(html, video_id) == (
         "https://v26-web.douyinvod.com/video.mp4?a=6383&x=1"
     )
+    assert _extract_douyin_video_id(html) == video_id

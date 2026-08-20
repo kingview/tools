@@ -47,6 +47,7 @@ def test_mainland_china_platforms_are_enabled() -> None:
     assert "douyin.com" in DEFAULT_ALLOWED_DOMAINS
     assert "xiaohongshu.com" in DEFAULT_ALLOWED_DOMAINS
     assert "xhslink.com" in DEFAULT_ALLOWED_DOMAINS
+    assert "xhslink.cn" in DEFAULT_ALLOWED_DOMAINS
 
 
 def test_platform_catalog_drives_domain_allowlist_and_ui() -> None:
@@ -65,4 +66,7 @@ def test_extracts_urls_from_chinese_share_text() -> None:
     )
     assert extract_post_url("打开小红书查看 http://xhslink.com/m/ABC123 ，复制本条信息") == (
         "https://xhslink.com/m/ABC123"
+    )
+    assert extract_post_url("打开小红书查看 http://xhslink.cn/o/ABC123") == (
+        "https://xhslink.cn/o/ABC123"
     )

@@ -72,7 +72,7 @@ class YtDlpBackend:
             "noplaylist": not request.include_playlists,
             "playlistend": request.max_items,
             "max_filesize": request.max_file_size_mb * 1024 * 1024,
-            "match_filter": _duration_filter(request.max_duration_seconds),
+            "match_filter": _download_filter(request.max_duration_seconds),
             "socket_timeout": request.request_timeout_seconds,
             "retries": 2,
             "fragment_retries": 2,
@@ -111,12 +111,19 @@ class YtDlpBackend:
                         base_options,
                     )
                     safe_info = downloader.sanitize_info(info) if info else None
-                except DownloadError:
-                    if not _is_douyin_url(extractor_url):
+                except DownloadError as exc:
+                    if _is_xiaohongshu_url(extractor_url) and _is_no_video_formats_error(exc):
+                        info, downloader = _extract_xiaohongshu_image_post(
+                            extractor_url,
+                            base_options,
+                        )
+                        safe_info = downloader.sanitize_info(info) if info else None
+                    elif not _is_douyin_url(extractor_url):
                         raise
-                    safe_info = _douyin_public_page_fallback(
-                        str(source_url), request, output_directory
-                    )
+                    else:
+                        safe_info = _douyin_public_page_fallback(
+                            str(source_url), request, output_directory
+                        )
                 if not safe_info:
                     continue
                 for item in _flatten_info(safe_info):
@@ -266,6 +273,7 @@ def _supports_image_posts(request: DownloadInput) -> bool:
     return any(
         (url.host or "").lower().endswith("xiaohongshu.com")
         or (url.host or "").lower().endswith("xhslink.com")
+        or (url.host or "").lower().endswith("xhslink.cn")
         for url in request.urls
     )
 
@@ -290,13 +298,23 @@ def _is_douyin_url(value: str) -> bool:
 def _douyin_public_page_fallback(
     page_url: str, request: DownloadInput, output_directory: Path
 ) -> dict[str, Any]:
-    video_id = _douyin_video_id(page_url)
+    html, resolved_url, runtime_media_url = _render_public_page(
+        page_url,
+        _douyin_video_id(page_url),
+        request.request_timeout_seconds,
+    )
+    video_id = _douyin_video_id(resolved_url) or _extract_douyin_video_id(html)
     if not video_id:
-        raise DownloadError("Unable to identify the Douyin video")
-    html = _render_public_page(page_url, video_id, request.request_timeout_seconds)
-    media_url = _extract_douyin_play_url(html, video_id)
+        raise DownloadError("Unable to identify the Douyin video after resolving the public page")
+    media_url = (
+        _validate_douyin_media_url(runtime_media_url)
+        if runtime_media_url
+        else _extract_douyin_play_url(html, video_id)
+    )
     title_match = re.search(r'<meta name="lark:url:video_title" content="([^"]*)"', html)
     title = unescape(title_match.group(1)) if title_match else f"Douyin-{video_id}"
+    if "\ufffd" in title:
+        title = f"Douyin-{video_id}"
 
     if request.mode is DownloadMode.DOWNLOAD:
         output_path = output_directory / f"Douyin-{video_id}.mp4"
@@ -331,6 +349,38 @@ def _douyin_public_page_fallback(
     }
 
 
+def _is_xiaohongshu_url(value: str) -> bool:
+    host = (urlsplit(value).hostname or "").lower().rstrip(".")
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in ("xiaohongshu.com", "xhslink.com", "xhslink.cn")
+    )
+
+
+def _is_no_video_formats_error(exc: DownloadError) -> bool:
+    return "no video formats found" in str(exc).lower()
+
+
+def _extract_xiaohongshu_image_post(
+    extractor_url: str,
+    base_options: dict[str, Any],
+) -> tuple[dict[str, Any] | None, yt_dlp.YoutubeDL]:
+    options = dict(base_options)
+    options.update(
+        {
+            "skip_download": True,
+            "writethumbnail": True,
+            "write_all_thumbnails": True,
+            "ignore_no_formats_error": True,
+        }
+    )
+    with yt_dlp.YoutubeDL(options) as downloader:
+        info = downloader.extract_info(extractor_url, download=True)
+        if info and not info.get("thumbnails"):
+            raise DownloadError("XiaoHongShu image post did not expose downloadable images")
+        return info, downloader
+
+
 def _douyin_video_id(value: str) -> str | None:
     parsed = urlsplit(value)
     modal_id = parse_qs(parsed.query).get("modal_id", [None])[0]
@@ -340,7 +390,14 @@ def _douyin_video_id(value: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _render_public_page(page_url: str, video_id: str, timeout: float) -> str:
+def _extract_douyin_video_id(html: str) -> str | None:
+    match = re.search(r"%22awemeId%22%3A%22(\d+)%22", html)
+    return match.group(1) if match else None
+
+
+def _render_public_page(
+    page_url: str, video_id: str | None, timeout: float
+) -> tuple[str, str, str | None]:
     timeout_ms = int(timeout * 1000)
     last_error: Exception | None = None
     with sync_playwright() as playwright:
@@ -350,13 +407,27 @@ def _render_public_page(page_url: str, video_id: str, timeout: float) -> str:
                 browser = playwright.chromium.launch(executable_path=str(executable), headless=True)
                 page = browser.new_page()
                 page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
-                marker = f"%22awemeId%22%3A%22{video_id}%22"
+                resolved_id = video_id or _douyin_video_id(page.url)
+                marker = (
+                    f"%22awemeId%22%3A%22{resolved_id}%22"
+                    if resolved_id
+                    else "%22awemeId%22%3A%22"
+                )
                 page.wait_for_function(
-                    "marker => document.documentElement.innerHTML.includes(marker)",
-                    arg=marker,
+                    "args => document.documentElement.innerHTML.includes(args.marker) || "
+                    "([...document.querySelectorAll('video')].some(video => "
+                    "video.currentSrc.includes('douyinvod.com') && "
+                    "(!args.videoId || video.currentSrc.includes(args.videoId))))",
+                    arg={"marker": marker, "videoId": resolved_id},
                     timeout=timeout_ms,
                 )
-                return page.content()
+                runtime_media_url = page.locator("video").evaluate_all(
+                    "(videos, videoId) => videos.map(video => video.currentSrc || video.src)"
+                    ".find(url => url.includes('douyinvod.com') && "
+                    "(!videoId || url.includes(videoId))) || null",
+                    resolved_id,
+                )
+                return page.content(), page.url, runtime_media_url
             except Exception as exc:
                 last_error = exc
             finally:
@@ -393,7 +464,10 @@ def _extract_douyin_play_url(html: str, video_id: str) -> str:
     )
     if not match:
         raise DownloadError("Douyin public media address was not found")
-    media_url = unquote(match.group(1))
+    return _validate_douyin_media_url(unquote(match.group(1)))
+
+
+def _validate_douyin_media_url(media_url: str) -> str:
     host = (urlsplit(media_url).hostname or "").lower()
     if not media_url.startswith("https://") or not (
         host.endswith(".douyinvod.com") or host.endswith(".douyin.com")
@@ -513,6 +587,33 @@ def _duration_filter(max_duration_seconds: int):
     return match
 
 
+def _download_filter(max_duration_seconds: int):
+    duration_filter = _duration_filter(max_duration_seconds)
+
+    def match(info: dict[str, Any], *, incomplete: bool = False) -> str | None:
+        _keep_xiaohongshu_original_images(info)
+        return duration_filter(info, incomplete=incomplete)
+
+    return match
+
+
+def _keep_xiaohongshu_original_images(info: dict[str, Any]) -> None:
+    if str(info.get("extractor_key", "")).lower() != "xiaohongshu":
+        return
+    thumbnails = info.get("thumbnails")
+    if not isinstance(thumbnails, list):
+        return
+    originals = [
+        thumbnail
+        for thumbnail in thumbnails
+        if isinstance(thumbnail, dict)
+        and "!nd_dft_" in str(thumbnail.get("url", "")).lower()
+    ]
+    if originals:
+        info["thumbnails"] = originals
+        info["thumbnail"] = originals[-1].get("url")
+
+
 def _flatten_info(info: dict[str, Any]) -> Iterable[dict[str, Any]]:
     entries = info.get("entries")
     if isinstance(entries, (list, tuple)):
@@ -529,7 +630,13 @@ def _redact_urls(message: str) -> str:
 
 def _download_error_message(exc: DownloadError) -> str:
     message = _redact_urls(str(exc))[:500]
-    if "fresh cookies" in message.lower():
+    lowered = message.lower()
+    if "[twitter]" in lowered and "no video could be found" in lowered:
+        return (
+            "该 X/Twitter 帖子没有可公开下载的视频。它可能是纯文字或图片帖，"
+            "也可能已删除、设为私密或需要登录权限。当前工具只下载公开可访问的内容。"
+        )
+    if "fresh cookies" in lowered:
         return (
             "抖音需要新鲜的浏览器站点会话。请先用 Chrome、Edge 或 Firefox 打开一次该公开作品，"
             "确认界面中的“首次或缓存失效时允许读取浏览器会话”已开启，然后重试。"

@@ -7,6 +7,9 @@ from urllib.parse import urlsplit
 from .errors import CrawlerError, ErrorCode
 
 
+_PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
 class PublicHttpsUrlPolicy:
     """Allowlisted HTTPS hosts only, with a best-effort SSRF DNS check."""
 
@@ -30,6 +33,11 @@ class PublicHttpsUrlPolicy:
             ) from exc
         for address in addresses:
             ip = ipaddress.ip_address(address)
-            if not ip.is_global:
+            # Clash-style proxy DNS uses RFC 2544 benchmark addresses as
+            # synthetic public-host placeholders. The hostname has already
+            # passed the strict domain allowlist above, so accept only this
+            # dedicated fake-IP range while continuing to reject real LAN,
+            # loopback, link-local, and other reserved destinations.
+            if not ip.is_global and ip not in _PROXY_FAKE_IP_NETWORK:
                 raise CrawlerError(ErrorCode.UNSAFE_URL, "media URL resolved to a non-public address")
 

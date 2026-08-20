@@ -30,7 +30,7 @@
 | 平台 | 入口域名 | 下载内容 | 支持级别 |
 |---|---|---|---|
 | 抖音 | `douyin.com`、`iesdouyin.com` | 视频 | 专用 extractor |
-| 小红书 | `xiaohongshu.com`、`xhslink.com` | 视频、图片 | 专用 extractor |
+| 小红书 | `xiaohongshu.com`、`xhslink.com`、`xhslink.cn` | 视频、图片 | 专用 extractor |
 | 哔哩哔哩 | `bilibili.com`、`b23.tv` | 视频、音频 | 专用 extractor |
 | 微博 | `weibo.com` | 视频 | 专用 extractor |
 | X / Twitter | `x.com`、`twitter.com` | 视频、音频 | 专用 extractor |
@@ -48,7 +48,7 @@
 ### 中国大陆平台
 
 - **抖音**：支持 `douyin.com`、`v.douyin.com`、`/jingxuan?modal_id=...` 和常见公开分享链接。
-- **小红书**：支持 `xiaohongshu.com`、`xhslink.com`；视频笔记下载视频，图文笔记自动保存 extractor 能识别到的全部图片。
+- **小红书**：支持 `xiaohongshu.com`、`xhslink.com`、`xhslink.cn`；视频笔记下载视频，图文笔记自动保存 extractor 能识别到的全部图片。
 - 小红书分享文案中常见的 `http://xhslink.com/...` 会在本地安全升级为 HTTPS 后处理。
 - 仅处理公开帖子。抖音当前可能要求新鲜的站点 Cookie；桌面端首次或缓存失效时允许从本机 Chrome、Edge、Firefox 或 Safari 自动读取站点会话，也可在界面中关闭。
 - 会话缓存位于系统用户的 PostDrop 应用数据目录，文件权限限制为仅当前用户可读写。账号登录 Cookie 和其他网站 Cookie 不会写入缓存。
