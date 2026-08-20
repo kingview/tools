@@ -4,11 +4,13 @@ from http.cookiejar import Cookie
 from pathlib import Path
 from stat import S_IMODE
 from types import SimpleNamespace
+import os
 
 from yt_dlp.utils import DownloadError
 
 from social_content_crawler.backend import (
     YtDlpBackend,
+    _extract_douyin_play_url,
     _format_selector,
     _strip_audio_tracks,
     normalize_extractor_url,
@@ -234,7 +236,8 @@ def test_douyin_retries_with_local_browser_session(monkeypatch, tmp_path: Path) 
     assert "douyin-session" in cached_text
     assert "sessionid" not in cached_text
     assert ".example.com" not in cached_text
-    assert S_IMODE(cookie_cache.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert S_IMODE(cookie_cache.stat().st_mode) == 0o600
 
     attempts.clear()
     backend.run(
@@ -249,3 +252,63 @@ def test_douyin_retries_with_local_browser_session(monkeypatch, tmp_path: Path) 
         (canonical_url, None, None),
         (canonical_url, None, str(cookie_cache)),
     ]
+
+
+def test_douyin_auto_falls_back_to_next_browser(monkeypatch, tmp_path: Path) -> None:
+    attempts = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+            self.cookiejar = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, url, download):
+            browser_options = self.options.get("cookiesfrombrowser")
+            browser = browser_options[0] if browser_options else None
+            attempts.append(browser)
+            if browser is None:
+                raise DownloadError("Fresh cookies are needed")
+            if browser == "chrome":
+                raise DownloadError("Could not copy Chrome cookie database")
+            return {"id": "123", "extractor_key": "Douyin", "webpage_url": url}
+
+        def sanitize_info(self, info):
+            return dict(info)
+
+    monkeypatch.setattr("social_content_crawler.backend.yt_dlp.YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(
+        "social_content_crawler.backend._browser_cookie_candidates",
+        lambda source: ["chrome", "edge"],
+    )
+
+    backend = YtDlpBackend(cookie_cache_path=tmp_path / "missing.cookies.txt")
+    items = backend.run(
+        DownloadInput(
+            urls=["https://www.douyin.com/video/123"],
+            mode="metadata_only",
+            browser_cookie_source=BrowserCookieSource.AUTO,
+        ),
+        tmp_path,
+    )
+
+    assert attempts == [None, "chrome", "edge"]
+    assert items[0]["id"] == "123"
+
+
+def test_extracts_douyin_public_page_play_url() -> None:
+    video_id = "7676033090649850202"
+    media_url = "https%3A%2F%2Fv26-web.douyinvod.com%2Fvideo.mp4%3Fa%3D6383%26x%3D1"
+    html = (
+        f"%22awemeId%22%3A%22{video_id}%22"
+        f"%22playAddr%22%3A%5B%7B%22src%22%3A%22{media_url}%22"
+    )
+
+    assert _extract_douyin_play_url(html, video_id) == (
+        "https://v26-web.douyinvod.com/video.mp4?a=6383&x=1"
+    )

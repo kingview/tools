@@ -6,13 +6,16 @@ import shutil
 import subprocess
 import sys
 import uuid
+from html import unescape
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 import imageio_ffmpeg
 import yt_dlp
+from playwright.sync_api import sync_playwright
 from yt_dlp.utils import DownloadError
 
 from .contracts import BrowserCookieSource, DownloadInput, DownloadMode, MediaFormat
@@ -101,15 +104,23 @@ class YtDlpBackend:
                 if len(collected) >= request.max_items:
                     break
                 extractor_url = normalize_extractor_url(str(source_url))
-                info, downloader = self._extract_with_browser_fallback(
-                    extractor_url,
-                    request,
-                    base_options,
-                )
-                if not info:
+                try:
+                    info, downloader = self._extract_with_browser_fallback(
+                        extractor_url,
+                        request,
+                        base_options,
+                    )
+                    safe_info = downloader.sanitize_info(info) if info else None
+                except DownloadError:
+                    if not _is_douyin_url(extractor_url):
+                        raise
+                    safe_info = _douyin_public_page_fallback(
+                        str(source_url), request, output_directory
+                    )
+                if not safe_info:
                     continue
-                for item in _flatten_info(info):
-                    safe = downloader.sanitize_info(item)
+                for item in _flatten_info(safe_info):
+                    safe = item
                     if isinstance(safe, dict):
                         safe["__source_url"] = str(source_url)
                         collected.append(safe)
@@ -276,6 +287,151 @@ def _is_douyin_url(value: str) -> bool:
     return host == "douyin.com" or host.endswith(".douyin.com")
 
 
+def _douyin_public_page_fallback(
+    page_url: str, request: DownloadInput, output_directory: Path
+) -> dict[str, Any]:
+    video_id = _douyin_video_id(page_url)
+    if not video_id:
+        raise DownloadError("Unable to identify the Douyin video")
+    html = _render_public_page(page_url, video_id, request.request_timeout_seconds)
+    media_url = _extract_douyin_play_url(html, video_id)
+    title_match = re.search(r'<meta name="lark:url:video_title" content="([^"]*)"', html)
+    title = unescape(title_match.group(1)) if title_match else f"Douyin-{video_id}"
+
+    if request.mode is DownloadMode.DOWNLOAD:
+        output_path = output_directory / f"Douyin-{video_id}.mp4"
+        _download_public_media(
+            media_url,
+            output_path,
+            page_url,
+            max_bytes=request.max_file_size_mb * 1024 * 1024,
+            timeout=request.request_timeout_seconds,
+        )
+        if request.media_format is MediaFormat.AUDIO:
+            ffmpeg = _ffmpeg_executable()
+            if not ffmpeg:
+                raise DownloadError("FFmpeg is required for audio extraction")
+            audio_path = output_path.with_suffix(".m4a")
+            completed = subprocess.run(
+                [ffmpeg, "-nostdin", "-y", "-i", str(output_path), "-vn", "-c:a", "copy", str(audio_path)],
+                capture_output=True,
+                check=False,
+                timeout=600,
+            )
+            if completed.returncode != 0 or not audio_path.is_file():
+                raise DownloadError("Unable to extract audio from the Douyin video")
+            output_path.unlink(missing_ok=True)
+
+    return {
+        "id": video_id,
+        "extractor_key": "DouyinPublicPage",
+        "webpage_url": page_url,
+        "title": title,
+        "__source_url": page_url,
+    }
+
+
+def _douyin_video_id(value: str) -> str | None:
+    parsed = urlsplit(value)
+    modal_id = parse_qs(parsed.query).get("modal_id", [None])[0]
+    if modal_id and modal_id.isdigit():
+        return modal_id
+    match = re.search(r"/video/(\d+)", parsed.path)
+    return match.group(1) if match else None
+
+
+def _render_public_page(page_url: str, video_id: str, timeout: float) -> str:
+    timeout_ms = int(timeout * 1000)
+    last_error: Exception | None = None
+    with sync_playwright() as playwright:
+        for executable in _chromium_executables():
+            browser = None
+            try:
+                browser = playwright.chromium.launch(executable_path=str(executable), headless=True)
+                page = browser.new_page()
+                page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                marker = f"%22awemeId%22%3A%22{video_id}%22"
+                page.wait_for_function(
+                    "marker => document.documentElement.innerHTML.includes(marker)",
+                    arg=marker,
+                    timeout=timeout_ms,
+                )
+                return page.content()
+            except Exception as exc:
+                last_error = exc
+            finally:
+                if browser is not None:
+                    browser.close()
+    raise DownloadError("Unable to render the public Douyin page") from last_error
+
+
+def _chromium_executables() -> list[Path]:
+    program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    candidates = [
+        program_files_x86 / "Microsoft/Edge/Application/msedge.exe",
+        program_files / "Microsoft/Edge/Application/msedge.exe",
+        local / "Microsoft/Edge/Application/msedge.exe",
+        program_files / "Google/Chrome/Application/chrome.exe",
+        program_files_x86 / "Google/Chrome/Application/chrome.exe",
+        local / "Google/Chrome/Application/chrome.exe",
+    ]
+    return [path for path in candidates if path.is_file()]
+
+
+def _extract_douyin_play_url(html: str, video_id: str) -> str:
+    from urllib.parse import unquote
+
+    marker = f"%22awemeId%22%3A%22{video_id}%22"
+    start = html.find(marker)
+    if start < 0:
+        raise DownloadError("Douyin public page data was not found")
+    match = re.search(
+        r"%22playAddr%22%3A%5B%7B%22src%22%3A%22(.*?)%22",
+        html[start : start + 300_000],
+    )
+    if not match:
+        raise DownloadError("Douyin public media address was not found")
+    media_url = unquote(match.group(1))
+    host = (urlsplit(media_url).hostname or "").lower()
+    if not media_url.startswith("https://") or not (
+        host.endswith(".douyinvod.com") or host.endswith(".douyin.com")
+    ):
+        raise DownloadError("Douyin returned an unexpected media host")
+    return media_url
+
+
+def _download_public_media(
+    media_url: str,
+    destination: Path,
+    referer: str,
+    *,
+    max_bytes: int,
+    timeout: float,
+) -> None:
+    request = Request(
+        media_url,
+        headers={"Referer": referer, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    total = 0
+    try:
+        with urlopen(request, timeout=timeout) as response, temporary.open("wb") as output:
+            length = response.headers.get("Content-Length")
+            if length and int(length) > max_bytes:
+                raise DownloadError("Douyin media exceeds the configured file size limit")
+            while chunk := response.read(1024 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise DownloadError("Douyin media exceeds the configured file size limit")
+                output.write(chunk)
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _browser_cookie_candidates(source: BrowserCookieSource) -> list[str]:
     if source is BrowserCookieSource.NONE:
         return []
@@ -305,10 +461,11 @@ def _browser_cookie_candidates(source: BrowserCookieSource) -> list[str]:
             ("edge", (home / ".config/microsoft-edge",)),
             ("firefox", (home / ".mozilla/firefox",)),
         ]
-    for browser, locations in candidates:
-        if any(location.exists() for location in locations):
-            return [browser]
-    return []
+    return [
+        browser
+        for browser, locations in candidates
+        if any(location.exists() for location in locations)
+    ]
 
 
 def _default_cookie_cache_path() -> Path:
