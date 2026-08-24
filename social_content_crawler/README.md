@@ -1,11 +1,82 @@
 # PostDrop / social.download_media
 
-项目的第一个只读 Tool，同时提供两个入口：
+项目提供两个相互独立的社媒读取 Tool：
 
-1. Agent 通过 Python 调用 `social.download_media`。
-2. 用户在 macOS 或 Windows 上运行 PostDrop 桌面 App，粘贴公开社媒帖子地址并点击下载。
+1. `social.browse_posts`：通过已授权的比特浏览器会话浏览抖音、小红书或 X，搜索并获取帖子 URL 与元数据。
+2. `social.download_media`：根据帖子 URL 下载媒体；同时提供 PostDrop 桌面 App。
 
-两个入口共用 `SocialMediaDownloadTool`、Pydantic 契约、`yt-dlp` Backend、安全策略、限流和审计逻辑，不存在两套下载实现。
+两个 Tool 使用独立契约和 Backend，共用 `SessionRegistry`、错误码、限流与审计基础设施。
+
+## social.browse_posts
+
+当前支持抖音、小红书和 X / Twitter，使用 PostDrop 已注册的、与平台绑定的 `session_ref` 连接对应比特浏览器 Profile：
+
+- 抖音：关键词搜索（综合、视频、用户）、用户主页作品、首页推荐流、指定抖音页面。
+- 小红书：关键词搜索（综合、最新、视频）、用户主页笔记、发现页、指定小红书页面。
+- X / Twitter：关键词搜索（热门、最新、媒体）、用户主页（帖子、媒体、回复）、时间线、指定页面。
+- 输出去重后的帖子 URL、帖子 ID、作者、正文、语言、发布时间、图片/视频类型和可见互动量。
+- 单次最多返回 100 条；滚动次数、页面超时和滚动等待均有上限。
+- 同一个 `session_ref` 同一进程内只允许一个浏览任务，避免并发操作同一 Profile。
+
+Agent 调用示例：
+
+```python
+import asyncio
+
+from social_content_crawler import (
+    BrowsePostsInput,
+    InMemoryAuditSink,
+    LocalRateLimiter,
+    SessionRegistry,
+    SocialPostBrowserBackend,
+    SocialPostBrowseTool,
+    default_session_registry_path,
+)
+from social_content_crawler.ports import ToolContext
+
+
+async def browse() -> None:
+    registry = SessionRegistry(default_session_registry_path())
+    tool = SocialPostBrowseTool(
+        backend=SocialPostBrowserBackend(session_registry=registry),
+        audit_sink=InMemoryAuditSink(),
+        rate_limiter=LocalRateLimiter(),
+    )
+    result = await tool.execute(
+        BrowsePostsInput(
+            platform="douyin",
+            session_ref="sess_douyin_REPLACE_WITH_POSTDROP_REFERENCE",
+            source="search",
+            view="media",
+            query="本地大模型",
+            max_items=20,
+        ),
+        ToolContext(
+            tenant_id="local-agent",
+            trace_id="browse-1",
+            actor_type="agent",
+            actor_id="research-agent",
+        ),
+    )
+    for post in result.posts:
+        print(post.url)
+
+
+asyncio.run(browse())
+```
+
+浏览 Backend 只调用比特浏览器 `/browser/open` 获取本机 CDP 地址，然后由 Playwright 新建临时标签页完成只读导航。采集完成后关闭临时标签页，保留 Profile 进程。它不会自动登录、提交表单、点赞、转发、关注、发布内容，也不会调用修改代理、指纹或 Cookie 的接口。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
+
+实现分层参考了 [MediaCrawler](https://github.com/NanmiCoder/MediaCrawler) 的“平台适配器 + Playwright/CDP + 登录态复用”思路，但没有复制其签名算法、私有接口调用或源代码。MediaCrawler 使用[非商用学习许可证](https://github.com/NanmiCoder/MediaCrawler/blob/main/LICENSE)，本项目的实现和使用必须独立遵守目标平台规则、账号授权边界及适用法律。
+
+推荐工作流：
+
+```text
+social.browse_posts
+→ social.download_media
+→ media.analyze_content
+→ media.generate_post_copy
+```
 
 ## 桌面 App
 
@@ -15,6 +86,7 @@
 - 支持直接粘贴抖音/小红书 App 生成的整段中文分享文案，自动提取其中短链。
 - 自动兼容抖音“精选”页面的 `modal_id` 链接并转换为标准作品地址。
 - 抖音遇到站点校验时，可在用户允许后读取一次本机浏览器会话；成功后只缓存抖音的匿名站点 Cookie，后续下载优先复用缓存。
+- 抖音、小红书和 X / Twitter 支持选择已经手动登录的比特浏览器 Profile；PostDrop 为每个平台分别生成可供 Agent 使用的 `session_ref`。
 - 选择音视频、仅视频（无声）或仅音频；三种模式语义互不重叠。
 - 可选保存封面、字幕。
 - 显示实时下载进度、速度和预计时间。
@@ -145,14 +217,46 @@ asyncio.run(main())
 
 Agent 调用默认不读取浏览器 Cookie。需要解析受抖音站点校验影响的公开链接时，可显式传入 `browser_cookie_source="auto"`；首次成功后会复用仅含抖音匿名站点 Cookie 的本地缓存，不会每次访问浏览器钥匙串。也可以指定 `chrome`、`edge`、`firefox` 或 `safari`。
 
+### 平台登录会话与 `session_ref`
+
+`session_ref` 不是比特浏览器自带字段，而是 PostDrop 为一个已注册 Profile 生成的不透明本地引用：
+
+1. 在比特浏览器中创建 Profile，并按账号自己的网络策略配置环境。
+2. 打开该 Profile，手动登录抖音、小红书或 X；确认 Cookie 已同步后可关闭窗口。
+3. 在 PostDrop 中点击“管理登录会话”。
+4. 从比特浏览器“系统设置”复制本地 API 地址，点击“读取 Profile”。
+5. 在界面选择相同平台和已登录 Profile，点击“生成 session_ref”，再复制给 Agent。
+
+Agent 调用示例：
+
+```python
+from social_content_crawler import (
+    DownloadInput,
+    SessionRegistry,
+    YtDlpBackend,
+    default_session_registry_path,
+)
+
+registry = SessionRegistry(default_session_registry_path())
+backend = YtDlpBackend(session_registry=registry)
+request = DownloadInput(
+    urls=["https://www.xiaohongshu.com/explore/NOTE_ID"],
+    session_ref="sess_xhs_REPLACE_WITH_POSTDROP_REFERENCE",
+)
+```
+
+Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码、代理或指纹参数。注册表只保存平台、引用、Profile ID、本机 API 地址和显示名称，不保存 Cookie。每次下载时，Backend 通过比特浏览器本地 API 读取该 Profile 对应平台的 Cookie，筛掉其他域名，写入权限为仅当前用户的临时文件；`yt-dlp` 返回或报错后都会删除临时文件。三类引用前缀分别为 `sess_douyin_`、`sess_xhs_`、`sess_x_`，不能跨平台使用。
+
+注册和下载只读取 `/health`、`/browser/list`、`/browser/detail`；浏览 Tool 额外调用 `/browser/open` 获取本机 CDP 地址并新建临时标签页。PostDrop 不自动登录、不关闭 Profile，也不修改 Profile 的代理和指纹。登录失效时会返回 `session_reauth_required`，需用户在对应 Profile 中重新手动登录并重新注册。
+
 ## 安全边界
 
-- 仅允许配置白名单中的公开 HTTPS 域名。
+- 仅允许配置白名单中的 HTTPS 域名；默认处理公开内容，或处理用户通过本地 `session_ref` 明确授权访问的抖音、小红书或 X 内容。
 - 调用前检查域名及 DNS 解析，拒绝内网/本机地址，降低 SSRF 风险。
 - 默认不展开播放列表，并限制条目数、单文件大小、总下载大小、媒体时长、超时和重试。
 - 下载目录由 Tool Executor 配置，Agent 和桌面输入框都不能指定任意文件路径。
 - 输入、输出、Tool 版本和错误码写入审计事件。
-- 不接收 Agent 传入的 Cookie、账号密码、验证码或代理。抖音需要站点校验时，可选择读取本机浏览器已有的抖音 Cookie；缓存会排除账号登录 Cookie，其他域名 Cookie 也不会缓存。Cookie 不会写入 Tool 输出、日志或审计事件。
+- 不接收 Agent 传入的 Cookie、账号密码、验证码、代理或指纹。抖音公开链接遇到站点校验时，可选择读取本机浏览器已有的匿名抖音 Cookie；账号登录下载和浏览只接受 PostDrop 生成的平台专属 `session_ref`。Cookie 仅在单次下载的临时文件或比特浏览器 Profile 内使用，不会写入 Tool 输出、注册表、日志或审计事件。
 - 不使用社媒平台官方开放 API，也不需要 API Key。
 - 只应下载你有权访问和保存的内容，并遵守目标平台规则及适用法律。
 
@@ -160,9 +264,9 @@ Agent 调用默认不读取浏览器 Cookie。需要解析受抖音站点校验�
 
 ## Tool 契约
 
-- 名称：`social.download_media`
-- 版本：`1.5.0`
-- 类型：`read`
-- 输入：`DownloadInput.model_json_schema()`
-- 输出：`DownloadOutput.model_json_schema()`
-- Dry Run：`mode="metadata_only"`
+| 名称 | 版本 | 类型 | 输入 | 输出 |
+|---|---:|---|---|---|
+| `social.browse_posts` | `1.0.0` | read | `BrowsePostsInput` | `BrowsePostsOutput` |
+| `social.download_media` | `1.6.0` | read | `DownloadInput` | `DownloadOutput` |
+
+`social.download_media` 的 Dry Run 为 `mode="metadata_only"`；`social.browse_posts` 没有 Dry Run，因为它本身只执行受限只读导航。

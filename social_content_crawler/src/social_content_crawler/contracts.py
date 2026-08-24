@@ -28,7 +28,7 @@ class BrowserCookieSource(StrEnum):
 
 
 class DownloadInput(BaseModel):
-    """Public social-media URLs only; browser sessions are local and optional."""
+    """Social-media URLs with an optional opaque, locally registered session reference."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -44,6 +44,12 @@ class DownloadInput(BaseModel):
     write_thumbnail: bool = False
     write_subtitles: bool = False
     browser_cookie_source: BrowserCookieSource = BrowserCookieSource.NONE
+    session_ref: str | None = Field(
+        default=None,
+        pattern=r"^sess_[a-z0-9]+_[A-Za-z0-9_-]{20,80}$",
+        max_length=96,
+        description="Opaque reference to a locally registered browser profile; never raw cookies.",
+    )
 
     @model_validator(mode="after")
     def validate_urls(self) -> DownloadInput:

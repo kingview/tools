@@ -16,6 +16,10 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_URL = "unsupported_url"
     DOWNLOAD_FAILED = "download_failed"
     LIMIT_EXCEEDED = "limit_exceeded"
+    SESSION_NOT_FOUND = "session_not_found"
+    SESSION_REAUTH_REQUIRED = "session_reauth_required"
+    SESSION_BUSY = "session_busy"
+    BROWSE_FAILED = "browse_failed"
 
 
 class CrawlerError(Exception):

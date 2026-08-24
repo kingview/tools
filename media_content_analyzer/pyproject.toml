@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "media-content-analyzer"
-version = "0.1.0"
+version = "0.10.7"
 description = "Contract-first local image, audio, and video understanding tool"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "h2>=4.2,<5",
     "httpx>=0.27,<1",
     "imageio-ffmpeg>=0.6,<1",
     "pillow>=11,<13",
@@ -22,13 +23,26 @@ image = [
 ]
 video = [
     "faster-whisper>=1.1,<2",
+    "modelscope>=1.30,<2",
     "scenedetect[opencv]>=0.6.6,<0.7",
 ]
-ocr = ["paddleocr>=3,<4"]
+ocr = ["lxml>=6,<7", "paddleocr>=3,<4"]
+desktop = ["pyside6==6.11.2"]
+repair = [
+    "onnxruntime>=1.20,<2",
+]
+repair-nvidia = [
+    "onnxruntime-gpu>=1.20,<2",
+]
 dev = ["pytest>=8.3"]
+build = ["pyinstaller>=6.16"]
 
 [project.scripts]
 media-content-analyzer = "media_content_analyzer.cli:main"
+media-content-analyzer-gui = "media_content_analyzer.desktop:main"
+media-watermark-processor = "media_content_analyzer.watermark_cli:main"
+media-watermark-processor-gui = "media_content_analyzer.watermark_desktop:main"
+video-repair-worker = "media_content_analyzer.video_repair_worker:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

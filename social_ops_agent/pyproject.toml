@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "social-ops-agent"
+version = "0.2.0"
+description = "A local conversational agent that orchestrates social browsing and download tools"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "media-content-analyzer>=0.5,<1",
+    "pydantic>=2.10,<3",
+    "pyside6==6.11.2",
+    "social-content-crawler>=0.4,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+build = ["pyinstaller>=6.16"]
+
+[project.scripts]
+social-ops-agent = "social_ops_agent.desktop:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -9,6 +9,10 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_MEDIA = "unsupported_media"
     LIMIT_EXCEEDED = "limit_exceeded"
     ANALYSIS_FAILED = "analysis_failed"
+    GENERATION_FAILED = "generation_failed"
+    AUTHORIZATION_REQUIRED = "authorization_required"
+    WATERMARK_DETECTION_FAILED = "watermark_detection_failed"
+    WATERMARK_REMOVAL_FAILED = "watermark_removal_failed"
     CONFIGURATION_ERROR = "configuration_error"
 
 

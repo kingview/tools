@@ -28,19 +28,19 @@ from .ports import AuditSink, DownloaderBackend, RateLimiter, ToolContext, UrlPo
 
 TOOL_SPEC = ToolSpec(
     name="social.download_media",
-    version="1.5.0",
-    description="Extract metadata or download public social-media video/audio with yt-dlp.",
+    version="1.6.0",
+    description="Extract metadata or download social-media media, optionally using a registered local session.",
     input_schema=DownloadInput.model_json_schema(),
     output_schema=DownloadOutput.model_json_schema(),
     category="read",
     side_effect=False,
-    risk_level="low",
+    risk_level="medium",
     timeout_seconds=900,
     max_retries=2,
     idempotent=True,
     supports_dry_run=True,
     required_permissions=["social_content.read", "media.download"],
-    policy_tags=["public-content-only", "optional-local-browser-session", "domain-allowlist", "audited"],
+    policy_tags=["public-or-authorized-content", "opaque-session-reference", "domain-allowlist", "audited"],
     rate_limit_bucket="social-media-public-read",
     requires_approval=False,
 )

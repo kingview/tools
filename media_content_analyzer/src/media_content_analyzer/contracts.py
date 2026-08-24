@@ -18,6 +18,108 @@ class ArtifactRef(BaseModel):
     media_type: str | None = Field(default=None, max_length=255)
 
 
+class WatermarkMode(StrEnum):
+    DETECT_ONLY = "detect_only"
+    REMOVE_IF_PRESENT = "remove_if_present"
+
+
+class WatermarkKind(StrEnum):
+    STATIC = "static"
+    MOVING = "moving"
+    TRANSLUCENT = "translucent"
+    UNKNOWN = "unknown"
+
+
+class WatermarkRepairQuality(StrEnum):
+    AUTO = "auto"
+    FAST = "fast"
+    BALANCED = "balanced"
+    HIGH = "high"
+
+
+class WatermarkRegion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int = Field(ge=3)
+    height: int = Field(ge=3)
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    first_seen_seconds: float | None = Field(default=None, ge=0)
+    last_seen_seconds: float | None = Field(default=None, ge=0)
+
+
+class ProcessWatermarkInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifacts: list[ArtifactRef] = Field(min_length=1, max_length=20)
+    mode: WatermarkMode = WatermarkMode.DETECT_ONLY
+    authorization_confirmed: bool = False
+    preserve_original: bool = True
+    minimum_confidence: float = Field(default=0.72, ge=0.5, le=0.99)
+    sample_frames: int | None = Field(default=None, ge=8, le=240)
+    manual_regions: dict[str, list[WatermarkRegion]] = Field(default_factory=dict)
+    track_manual_regions: bool = False
+    tracking_search_radius: int = Field(default=240, ge=32, le=1_200)
+    inpaint_radius: int = Field(default=5, ge=1, le=20)
+    repair_quality: WatermarkRepairQuality = WatermarkRepairQuality.AUTO
+    temporal_consistency: bool = True
+    max_total_size_mb: int = Field(default=5_000, ge=1, le=20_000)
+
+    @field_validator("preserve_original")
+    @classmethod
+    def require_original_preservation(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("original artifacts must always be preserved")
+        return value
+
+    @field_validator("authorization_confirmed")
+    @classmethod
+    def normalize_authorization(cls, value: bool) -> bool:
+        return bool(value)
+
+    def validate_removal_authorization(self) -> None:
+        if self.mode is WatermarkMode.REMOVE_IF_PRESENT and not self.authorization_confirmed:
+            raise ValueError("watermark removal requires explicit authorization confirmation")
+
+
+class ProcessedWatermarkArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    media_type: str = "video/mp4"
+    derived_from_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+
+
+class WatermarkArtifactResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    original: ArtifactRef
+    detected: bool
+    kind: WatermarkKind | None = None
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    regions: list[WatermarkRegion] = Field(default_factory=list)
+    processed_artifact: ProcessedWatermarkArtifact | None = None
+    quality_score: float | None = Field(default=None, ge=0, le=1)
+    repair_quality_requested: WatermarkRepairQuality | None = None
+    repair_quality_applied: WatermarkRepairQuality | None = None
+    repair_method: str | None = Field(default=None, max_length=255)
+    needs_human_review: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ProcessWatermarkOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[WatermarkArtifactResult]
+    detected_count: int = Field(ge=0)
+    processed_count: int = Field(ge=0)
+    output_directory: str | None = None
+    detector_version: str
+
+
 class AnalyzeContentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -126,6 +228,62 @@ class ContentAnalysisOutput(BaseModel):
     cache_hit: bool = False
     pipeline_version: str
     model_versions: dict[str, str]
+
+
+class CopyPlatform(StrEnum):
+    GENERIC = "generic"
+    DOUYIN = "douyin"
+    XIAOHONGSHU = "xiaohongshu"
+    BILIBILI = "bilibili"
+    WEIBO = "weibo"
+    INSTAGRAM = "instagram"
+    TIKTOK = "tiktok"
+
+
+class CopyTone(StrEnum):
+    NATURAL = "natural"
+    RECOMMENDATION = "recommendation"
+    PROFESSIONAL = "professional"
+    HUMOROUS = "humorous"
+    EMOTIONAL = "emotional"
+    SUGGESTIVE = "suggestive"
+
+
+class GeneratePostCopyInput(BaseModel):
+    """Agent/GUI request for copy grounded in a completed analysis."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis: ContentAnalysisOutput
+    platform: CopyPlatform = CopyPlatform.GENERIC
+    tone: CopyTone = CopyTone.NATURAL
+    language: str = Field(default="zh", min_length=2, max_length=32)
+    objective: str | None = Field(default=None, max_length=1_000)
+    extra_instructions: str | None = Field(default=None, max_length=10_000)
+    variant_count: int = Field(default=3, ge=1, le=5)
+    max_characters: int = Field(default=300, ge=20, le=5_000)
+    include_hashtags: bool = True
+
+
+class GeneratedPostCopy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=500)
+    body: str = Field(min_length=1, max_length=10_000)
+    hashtags: list[str] = Field(default_factory=list, max_length=30)
+    call_to_action: str | None = Field(default=None, max_length=1_000)
+
+
+class GeneratePostCopyOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    language: str
+    platform: CopyPlatform
+    tone: CopyTone
+    variants: list[GeneratedPostCopy] = Field(min_length=1, max_length=5)
+    warnings: list[str] = Field(default_factory=list)
+    needs_human_review: bool = False
+    model_version: str
 
 
 class ToolSpec(BaseModel):

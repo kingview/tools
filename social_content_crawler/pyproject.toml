@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-content-crawler"
-version = "0.2.4"
-description = "A contract-first social media media downloader powered by yt-dlp"
+version = "0.4.0"
+description = "Contract-first social post browsing and media downloading for local agents"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

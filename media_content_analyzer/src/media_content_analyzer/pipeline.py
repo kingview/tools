@@ -28,7 +28,7 @@ from .ports import OcrEngine, SemanticResult, Transcriber, VisionModel
 class LocalMediaAnalysisBackend:
     """Deterministic preprocessing followed by an optional local semantic model."""
 
-    BASE_PIPELINE_VERSION = "media-analysis-pipeline-1.0.0"
+    BASE_PIPELINE_VERSION = "media-analysis-pipeline-1.1.1"
 
     def __init__(
         self,
@@ -136,7 +136,8 @@ class LocalMediaAnalysisBackend:
                     )
                 except Exception as exc:
                     warnings.append(
-                        f"Semantic model failed; deterministic fallback used ({type(exc).__name__})."
+                        "Semantic model failed; deterministic fallback used "
+                        f"({_exception_summary(exc)})."
                     )
 
         if semantic is None:
@@ -229,7 +230,7 @@ class LocalMediaAnalysisBackend:
                 try:
                     ocr_text = _unique(self._ocr.extract(prepared))
                 except Exception as exc:
-                    warnings.append(f"OCR failed ({type(exc).__name__}).")
+                    warnings.append(f"OCR failed ({_exception_summary(exc)}).")
         for number, text in enumerate(ocr_text, start=1):
             evidence.append(
                 Evidence(
@@ -302,7 +303,10 @@ class LocalMediaAnalysisBackend:
                         try:
                             ocr_text.extend(self._ocr.extract(frame))
                         except Exception as exc:
-                            warnings.append(f"Video-frame OCR failed ({type(exc).__name__}).")
+                            warnings.append(
+                                "Video-frame OCR failed "
+                                f"({_exception_summary(exc)})."
+                            )
                             break
             ocr_text = _unique(ocr_text)
             for number, text in enumerate(ocr_text, start=1):
@@ -328,12 +332,18 @@ class LocalMediaAnalysisBackend:
                             audio_path, request.language_hint
                         )
                     except Exception as exc:
-                        warnings.append(f"Speech recognition failed ({type(exc).__name__}).")
+                        warnings.append(
+                            "Speech recognition failed "
+                            f"({_exception_summary(exc)})."
+                        )
                 elif modality == "audio":
                     try:
                         transcript = self._transcriber.transcribe(path, request.language_hint)
                     except Exception as exc:
-                        warnings.append(f"Speech recognition failed ({type(exc).__name__}).")
+                        warnings.append(
+                            "Speech recognition failed "
+                            f"({_exception_summary(exc)})."
+                        )
                 else:
                     warnings.append("No decodable audio track was found.")
         for number, segment in enumerate(transcript, start=1):
@@ -502,6 +512,13 @@ def _find_ffmpeg() -> str | None:
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return None
+
+
+def _exception_summary(exc: Exception, maximum: int = 240) -> str:
+    message = " ".join(str(exc).split())
+    if len(message) > maximum:
+        message = f"{message[: maximum - 1]}…"
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def _detect_media(path: Path, declared_type: str | None) -> tuple[str, str]:

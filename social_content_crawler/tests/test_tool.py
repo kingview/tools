@@ -68,7 +68,7 @@ def test_download_normalizes_artifact_and_audits(tmp_path: Path) -> None:
     assert len(result.artifacts[0].sha256) == 64
     assert Path(result.artifacts[0].path).is_relative_to(tmp_path)
     assert audit.events[0].event_type == "tool.succeeded"
-    assert audit.events[0].tool_version == "1.5.0"
+    assert audit.events[0].tool_version == "1.6.0"
 
 
 def test_metadata_only_is_dry_run(tmp_path: Path) -> None:
@@ -96,6 +96,19 @@ def test_input_rejects_http_and_credentials() -> None:
         DownloadInput(urls=["http://example.com/video"])
     with pytest.raises(ValidationError):
         DownloadInput(urls=["https://user:password@example.com/video"])
+
+
+def test_input_accepts_only_opaque_session_references() -> None:
+    request = DownloadInput(
+        urls=["https://x.com/author/status/1"],
+        session_ref="sess_x_abcdefghijklmnopqrstuvwx",
+    )
+    assert request.session_ref.startswith("sess_x_")
+    with pytest.raises(ValidationError):
+        DownloadInput(
+            urls=["https://x.com/author/status/1"],
+            session_ref="raw-cookie=value",
+        )
 
 
 def test_tool_spec_is_contract_first() -> None:

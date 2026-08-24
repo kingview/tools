@@ -8,6 +8,8 @@ from .contracts import (
     AnalyzeContentInput,
     AuditEvent,
     ContentAnalysisOutput,
+    GeneratePostCopyInput,
+    GeneratePostCopyOutput,
     TranscriptSegment,
 )
 
@@ -85,3 +87,9 @@ class VisionModel(Protocol):
         untrusted_content: str,
         language_hint: str | None,
     ) -> SemanticResult | None: ...
+
+
+class CopyGenerator(Protocol):
+    name: str
+
+    def generate(self, request: GeneratePostCopyInput) -> GeneratePostCopyOutput: ...

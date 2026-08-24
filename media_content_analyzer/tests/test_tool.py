@@ -22,8 +22,9 @@ from media_content_analyzer.errors import AnalyzerError, ErrorCode
 class FakeBackend:
     pipeline_version = "test-pipeline-v1"
 
-    def __init__(self) -> None:
+    def __init__(self, *, warnings: list[str] | None = None) -> None:
         self.calls = 0
+        self.warnings = warnings or []
 
     def analyze(self, request, artifacts, work_directory):
         self.calls += 1
@@ -46,6 +47,7 @@ class FakeBackend:
                     modality="image",
                 )
             ],
+            warnings=self.warnings,
             pipeline_version=self.pipeline_version,
             model_versions={},
         )
@@ -104,6 +106,33 @@ def test_tool_validates_manifest_and_uses_cache(tmp_path: Path) -> None:
         "tool.succeeded",
         "tool.succeeded",
     ]
+
+
+def test_tool_does_not_cache_transient_semantic_model_fallback(tmp_path: Path) -> None:
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    image = media_root / "post.jpg"
+    image.write_bytes(b"image-content")
+    backend = FakeBackend(
+        warnings=[
+            "Semantic model failed; deterministic fallback used (ConnectError)."
+        ]
+    )
+    tool = MediaContentAnalyzerTool(
+        backend=backend,
+        audit_sink=InMemoryAuditSink(),
+        cache=InMemoryAnalysisCache(),
+        allowed_media_root=media_root,
+        work_root=tmp_path / "work",
+    )
+    request = AnalyzeContentInput(artifacts=[_manifest(image)])
+
+    first = asyncio.run(tool.execute(request, _context()))
+    second = asyncio.run(tool.execute(request, _context()))
+
+    assert first.cache_hit is False
+    assert second.cache_hit is False
+    assert backend.calls == 2
 
 
 def test_tool_rejects_file_outside_media_root(tmp_path: Path) -> None:

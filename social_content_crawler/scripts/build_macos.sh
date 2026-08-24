@@ -17,6 +17,7 @@ fi
   --osx-bundle-identifier com.socialagent.postdrop \
   --paths src \
   --collect-all imageio_ffmpeg \
+  --collect-all playwright \
   --collect-all yt_dlp \
   --collect-submodules social_content_crawler \
   desktop_main.py

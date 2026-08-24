@@ -6,16 +6,21 @@ import uuid
 from pathlib import Path
 
 from .adapters import (
+    DEFAULT_OLLAMA_MODEL,
     FasterWhisperTranscriber,
     NoopOcrEngine,
     NoopTranscriber,
     NoopVisionModel,
     OpenAICompatibleVisionModel,
+    OpenAICompatibleCopyGenerator,
     PaddleOcrEngine,
 )
-from .contracts import AuditEvent, ContentAnalysisOutput
+from .audit import InMemoryAuditSink, JsonLinesAuditSink
+from .contracts import ContentAnalysisOutput
 from .pipeline import LocalMediaAnalysisBackend
 from .tool import MediaContentAnalyzerTool
+from .copy_tool import ContentCopyGeneratorTool
+from .watermark_runtime import build_local_watermark_tool
 
 
 class InMemoryAnalysisCache:
@@ -55,26 +60,6 @@ class JsonFileAnalysisCache:
         return self._directory / f"{key}.json"
 
 
-class InMemoryAuditSink:
-    def __init__(self) -> None:
-        self.events: list[AuditEvent] = []
-
-    async def record(self, event: AuditEvent) -> None:
-        self.events.append(event)
-
-
-class JsonLinesAuditSink:
-    def __init__(self, path: Path) -> None:
-        self._path = path.expanduser().resolve()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-
-    async def record(self, event: AuditEvent) -> None:
-        line = event.model_dump_json() + "\n"
-        with self._lock, self._path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-
-
 def build_local_tool(
     *,
     allowed_media_root: Path,
@@ -83,7 +68,7 @@ def build_local_tool(
     enable_asr: bool = True,
     enable_vision: bool = True,
     model_base_url: str | None = None,
-    model_name: str = "content_understander",
+    model_name: str = DEFAULT_OLLAMA_MODEL,
     model_api_key: str | None = None,
     whisper_model: str = "small",
     ffmpeg_path: str | None = None,
@@ -110,7 +95,7 @@ def build_local_tool(
             api_key=model_api_key,
         )
     elif enable_vision:
-        vision = OpenAICompatibleVisionModel.from_environment()
+        vision = OpenAICompatibleVisionModel.from_environment(default_model=model_name)
     backend = LocalMediaAnalysisBackend(
         ocr_engine=ocr,
         transcriber=transcriber,
@@ -124,4 +109,28 @@ def build_local_tool(
         cache=JsonFileAnalysisCache(state_root / "cache"),
         allowed_media_root=allowed_media_root,
         work_root=state_root / "work",
+    )
+
+
+def build_local_copy_tool(
+    *,
+    state_root: Path,
+    model_base_url: str | None = None,
+    model_name: str = DEFAULT_OLLAMA_MODEL,
+    model_api_key: str | None = None,
+) -> ContentCopyGeneratorTool:
+    state_root = state_root.expanduser().resolve()
+    state_root.mkdir(parents=True, exist_ok=True)
+    generator = (
+        OpenAICompatibleCopyGenerator(
+            base_url=model_base_url,
+            model=model_name,
+            api_key=model_api_key,
+        )
+        if model_base_url
+        else OpenAICompatibleCopyGenerator.from_environment(default_model=model_name)
+    )
+    return ContentCopyGeneratorTool(
+        generator=generator,
+        audit_sink=JsonLinesAuditSink(state_root / "audit.jsonl"),
     )

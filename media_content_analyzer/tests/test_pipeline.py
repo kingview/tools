@@ -47,6 +47,13 @@ class FakeVision:
         )
 
 
+class FailingVision:
+    name = "openai-compatible:qwen3.5:9b"
+
+    def understand(self, *, images, trusted_context, untrusted_content, language_hint):
+        raise ConnectionError("Ollama is unavailable")
+
+
 def _request(path: Path, **changes) -> AnalyzeContentInput:
     data = path.read_bytes()
     values = {
@@ -109,3 +116,24 @@ def test_image_pipeline_has_deterministic_fallback(tmp_path: Path) -> None:
     assert result.confidence == 0.5
     assert result.needs_human_review is True
     assert any("Semantic model is not configured" in item for item in result.warnings)
+
+
+def test_image_pipeline_falls_back_when_ollama_is_unavailable(tmp_path: Path) -> None:
+    image_path = tmp_path / "post.png"
+    Image.new("RGB", (40, 30), color="white").save(image_path)
+    backend = LocalMediaAnalysisBackend(
+        ocr_engine=FakeOcr(),
+        transcriber=FakeTranscriber(),
+        vision_model=FailingVision(),
+        ffmpeg_path="/missing/ffmpeg",
+    )
+
+    result = backend.analyze(_request(image_path), [image_path], tmp_path / "work")
+
+    assert "新品发布会" in result.summary
+    assert result.confidence == 0.5
+    assert result.needs_human_review is True
+    assert any("Semantic model failed" in item for item in result.warnings)
+    assert result.model_versions["content_understander"] == (
+        "openai-compatible:qwen3.5:9b"
+    )

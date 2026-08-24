@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from contextlib import nullcontext
 from html import unescape
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
@@ -20,6 +21,7 @@ from yt_dlp.utils import DownloadError
 
 from .contracts import BrowserCookieSource, DownloadInput, DownloadMode, MediaFormat
 from .errors import CrawlerError, ErrorCode
+from .sessions import SessionRegistry
 
 
 _DOUYIN_AUTH_COOKIE_NAMES = {
@@ -50,17 +52,41 @@ class _QuietLogger:
 
 
 class YtDlpBackend:
-    """Embedded yt-dlp with a deliberately small and non-authenticated option surface."""
+    """Embedded yt-dlp with public access plus optional registered local sessions."""
 
     def __init__(
         self,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         cookie_cache_path: Path | None = None,
+        session_registry: SessionRegistry | None = None,
     ) -> None:
         self._progress_callback = progress_callback
         self._cookie_cache_path = (cookie_cache_path or _default_cookie_cache_path()).expanduser()
+        self._session_registry = session_registry
 
     def run(self, request: DownloadInput, output_directory: Path) -> list[dict[str, Any]]:
+        if request.session_ref:
+            if self._session_registry is None:
+                raise CrawlerError(
+                    ErrorCode.CONFIGURATION_ERROR,
+                    "当前 Tool Executor 没有配置 session_ref 注册表。",
+                )
+            session_context = self._session_registry.materialize_cookiefile(
+                request.session_ref,
+                [str(url) for url in request.urls],
+                output_directory,
+            )
+        else:
+            session_context = nullcontext(None)
+        with session_context as session_cookiefile:
+            return self._run(request, output_directory, session_cookiefile)
+
+    def _run(
+        self,
+        request: DownloadInput,
+        output_directory: Path,
+        session_cookiefile: Path | None,
+    ) -> list[dict[str, Any]]:
         download_post_images = _supports_image_posts(request)
         ffmpeg_executable = _ffmpeg_executable()
         base_options: dict[str, Any] = {
@@ -96,6 +122,8 @@ class YtDlpBackend:
         }
         if ffmpeg_executable is not None:
             base_options["ffmpeg_location"] = ffmpeg_executable
+        if session_cookiefile is not None:
+            base_options["cookiefile"] = str(session_cookiefile)
         if self._progress_callback is not None:
             base_options["progress_hooks"] = [self._progress_callback]
         collected: list[dict[str, Any]] = []

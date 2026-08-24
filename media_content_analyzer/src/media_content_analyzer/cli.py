@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
+from .adapters import DEFAULT_OLLAMA_MODEL
 from .contracts import AnalyzeContentInput, ArtifactRef
 from .errors import AnalyzerError
 from .ports import ToolContext
@@ -35,8 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-keyframes", type=int, default=24)
     parser.add_argument("--max-duration", type=int, default=3_600)
     parser.add_argument("--whisper-model", default="small")
-    parser.add_argument("--model-base-url", help="LiteLLM/vLLM OpenAI-compatible /v1 URL")
-    parser.add_argument("--model", default="content_understander")
+    parser.add_argument(
+        "--model-base-url",
+        help=(
+            "Ollama/LiteLLM/vLLM OpenAI-compatible URL "
+            "(default: http://127.0.0.1:11434/v1)"
+        ),
+    )
+    parser.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
     parser.add_argument("--model-api-key")
     parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("--no-asr", action="store_true")

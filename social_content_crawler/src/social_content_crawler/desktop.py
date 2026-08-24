@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -36,12 +37,18 @@ from .errors import CrawlerError
 from .platforms import default_allowed_domains, supported_platform_label
 from .ports import ToolContext
 from .runtime import InMemoryAuditSink, LocalRateLimiter
+from .sessions import BitBrowserClient, SessionRegistry, default_session_registry_path
 from .tool import SocialMediaDownloadTool
 from .url_policy import PublicHttpsUrlPolicy
 
 
 APP_NAME = "PostDrop"
 DEFAULT_ALLOWED_DOMAINS = default_allowed_domains()
+SESSION_PLATFORM_LABELS = {
+    "douyin": "抖音",
+    "xiaohongshu": "小红书",
+    "x": "X / Twitter",
+}
 
 
 class DownloadWorker(QThread):
@@ -54,15 +61,20 @@ class DownloadWorker(QThread):
         request: DownloadInput,
         output_root: Path,
         allowed_domains: frozenset[str],
+        session_registry_path: Path,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._request = request
         self._output_root = output_root
         self._allowed_domains = allowed_domains
+        self._session_registry_path = session_registry_path
 
     def run(self) -> None:
-        backend = YtDlpBackend(progress_callback=self._on_progress)
+        backend = YtDlpBackend(
+            progress_callback=self._on_progress,
+            session_registry=SessionRegistry(self._session_registry_path),
+        )
         tool = SocialMediaDownloadTool(
             backend=backend,
             audit_sink=InMemoryAuditSink(),
@@ -118,16 +130,183 @@ class DownloadWorker(QThread):
         self.progress_changed.emit(percent, message)
 
 
+class SessionManagerDialog(QDialog):
+    sessions_changed = Signal()
+
+    def __init__(self, registry: SessionRegistry, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._registry = registry
+        self.setWindowTitle("管理社媒登录会话")
+        self.setMinimumWidth(590)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        title = QLabel("注册已手动登录的比特浏览器 Profile")
+        title.setObjectName("dialogTitle")
+        copy = QLabel(
+            "PostDrop 会生成 session_ref。下载或浏览时临时读取该 Profile 对应平台的 Cookie，用完即删除；"
+            "不会读取密码，也不会修改代理或指纹。"
+        )
+        copy.setObjectName("dialogCopy")
+        copy.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(copy)
+
+        layout.addWidget(_option_label("社媒平台"))
+        self.platform_combo = QComboBox()
+        self.platform_combo.setObjectName("optionControl")
+        for platform, label in SESSION_PLATFORM_LABELS.items():
+            self.platform_combo.addItem(label, platform)
+        layout.addWidget(self.platform_combo)
+
+        layout.addWidget(_option_label("比特浏览器本地 API 地址"))
+        api_row = QHBoxLayout()
+        self.api_url_input = QLineEdit()
+        self.api_url_input.setObjectName("sessionInput")
+        self.api_url_input.setPlaceholderText("从比特浏览器「系统设置 → 本地 API」复制，例如 http://127.0.0.1:端口")
+        previous = self._registry.list()
+        self.api_url_input.setText(
+            os.getenv("BITBROWSER_API_URL", previous[-1].api_url if previous else "")
+        )
+        self.load_profiles_button = QPushButton("读取 Profile")
+        self.load_profiles_button.setObjectName("secondaryButton")
+        self.load_profiles_button.clicked.connect(self.load_profiles)
+        api_row.addWidget(self.api_url_input, 1)
+        api_row.addWidget(self.load_profiles_button)
+        layout.addLayout(api_row)
+
+        layout.addWidget(_option_label("已在所选平台手动登录的 Profile"))
+        profile_row = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.setObjectName("optionControl")
+        self.profile_combo.addItem("请先读取 Profile", None)
+        self.register_button = QPushButton("生成 session_ref")
+        self.register_button.setObjectName("primaryButton")
+        self.register_button.clicked.connect(self.register_profile)
+        profile_row.addWidget(self.profile_combo, 1)
+        profile_row.addWidget(self.register_button)
+        layout.addLayout(profile_row)
+
+        layout.addWidget(_option_label("刚生成的 session_ref"))
+        ref_row = QHBoxLayout()
+        self.session_ref_output = QLineEdit()
+        self.session_ref_output.setObjectName("sessionInput")
+        self.session_ref_output.setReadOnly(True)
+        self.session_ref_output.setPlaceholderText("注册成功后显示，可复制给 Agent 调用")
+        copy_button = QPushButton("复制")
+        copy_button.setObjectName("secondaryButton")
+        copy_button.clicked.connect(self.copy_session_ref)
+        ref_row.addWidget(self.session_ref_output, 1)
+        ref_row.addWidget(copy_button)
+        layout.addLayout(ref_row)
+
+        layout.addWidget(_option_label("已注册会话"))
+        registered_row = QHBoxLayout()
+        self.registered_combo = QComboBox()
+        self.registered_combo.setObjectName("optionControl")
+        self.remove_button = QPushButton("移除引用")
+        self.remove_button.setObjectName("secondaryButton")
+        self.remove_button.clicked.connect(self.remove_session)
+        registered_row.addWidget(self.registered_combo, 1)
+        registered_row.addWidget(self.remove_button)
+        layout.addLayout(registered_row)
+        self._refresh_registered()
+
+        close_button = QPushButton("完成")
+        close_button.setObjectName("secondaryButton")
+        close_button.clicked.connect(self.accept)
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+    def load_profiles(self) -> None:
+        try:
+            client = BitBrowserClient(self.api_url_input.text())
+            client.health()
+            profiles = client.list_profiles()
+        except CrawlerError as exc:
+            QMessageBox.warning(self, "无法读取 Profile", str(exc))
+            return
+        self.profile_combo.clear()
+        if not profiles:
+            self.profile_combo.addItem("没有可用 Profile", None)
+            return
+        for profile in profiles:
+            self.profile_combo.addItem(f"{profile.name}  ·  {profile.profile_id}", profile.profile_id)
+
+    def register_profile(self) -> None:
+        profile_id = self.profile_combo.currentData()
+        platform = str(self.platform_combo.currentData())
+        platform_label = SESSION_PLATFORM_LABELS[platform]
+        if not profile_id:
+            QMessageBox.warning(
+                self,
+                "尚未选择 Profile",
+                f"请先读取并选择一个已登录 {platform_label} 的 Profile。",
+            )
+            return
+        try:
+            record = self._registry.register_bitbrowser(
+                platform,
+                self.api_url_input.text(),
+                str(profile_id),
+            )
+        except CrawlerError as exc:
+            QMessageBox.warning(self, "注册没有完成", str(exc))
+            return
+        self.session_ref_output.setText(record.session_ref)
+        self.session_ref_output.selectAll()
+        self._refresh_registered(record.session_ref)
+        self.sessions_changed.emit()
+
+    def copy_session_ref(self) -> None:
+        if self.session_ref_output.text():
+            QApplication.clipboard().setText(self.session_ref_output.text())
+
+    def remove_session(self) -> None:
+        session_ref = self.registered_combo.currentData()
+        if not session_ref:
+            return
+        self._registry.revoke(str(session_ref))
+        self._refresh_registered()
+        self.sessions_changed.emit()
+
+    def _refresh_registered(self, selected_ref: str | None = None) -> None:
+        self.registered_combo.clear()
+        records = self._registry.list()
+        if not records:
+            self.registered_combo.addItem("尚未注册", None)
+            self.remove_button.setEnabled(False)
+            return
+        self.remove_button.setEnabled(True)
+        for record in records:
+            suffix = record.session_ref[-8:]
+            platform_label = SESSION_PLATFORM_LABELS.get(record.platform, record.platform)
+            self.registered_combo.addItem(
+                f"{platform_label} · {record.profile_name} · …{suffix}",
+                record.session_ref,
+            )
+            if record.session_ref == selected_ref:
+                self.registered_combo.setCurrentIndex(self.registered_combo.count() - 1)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
         *,
         output_root: Path | None = None,
         allowed_domains: frozenset[str] | None = None,
+        session_registry_path: Path | None = None,
     ) -> None:
         super().__init__()
         self._output_root = (output_root or default_output_root()).resolve()
         self._allowed_domains = allowed_domains or configured_domains()
+        self._session_registry_path = (
+            session_registry_path or default_session_registry_path()
+        ).expanduser().resolve()
+        self._session_registry = SessionRegistry(self._session_registry_path)
         self._worker: DownloadWorker | None = None
         self._last_output: DownloadOutput | None = None
         self.setWindowTitle("PostDrop · 社媒帖子下载器")
@@ -176,7 +355,7 @@ class MainWindow(QMainWindow):
         content_layout.addSpacing(26)
         content_layout.addWidget(hero)
 
-        subtitle = QLabel("粘贴公开社媒帖子的地址，一键下载其中的视频、音频、封面和字幕。")
+        subtitle = QLabel("粘贴公开帖子，或选择你已登录且有权访问的平台会话，下载视频、音频、封面和字幕。")
         subtitle.setObjectName("subtitle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setWordWrap(True)
@@ -205,7 +384,7 @@ class MainWindow(QMainWindow):
         card_title_box.addWidget(title)
         card_header.addLayout(card_title_box)
         card_header.addStretch()
-        safe_note = QLabel("公开内容 · 本地保存")
+        safe_note = QLabel("本地保存 · 可选登录会话")
         safe_note.setObjectName("safeNote")
         card_header.addWidget(safe_note)
         card_layout.addLayout(card_header)
@@ -229,7 +408,7 @@ class MainWindow(QMainWindow):
         input_row.addWidget(self.download_button)
         card_layout.addLayout(input_row)
 
-        help_text = QLabel("仅支持公开 HTTPS 帖子地址，也可以直接把链接拖进窗口")
+        help_text = QLabel("支持公开 HTTPS 帖子；抖音、小红书和 X 可选择已注册登录会话。也可以把链接拖进窗口")
         help_text.setObjectName("helpText")
         card_layout.addWidget(help_text)
 
@@ -262,6 +441,20 @@ class MainWindow(QMainWindow):
         options.addWidget(self.thumbnail_check, 2, 0)
         options.addWidget(self.subtitle_check, 2, 1)
         options.addWidget(self.browser_session_check, 3, 0, 1, 2)
+        session_label_row = QHBoxLayout()
+        session_label_row.addWidget(_option_label("平台登录会话（可选）"))
+        session_label_row.addStretch()
+        self.manage_sessions_button = QPushButton("管理登录会话")
+        self.manage_sessions_button.setObjectName("inlineButton")
+        self.manage_sessions_button.clicked.connect(self.manage_sessions)
+        session_label_row.addWidget(self.manage_sessions_button)
+        session_control = QWidget()
+        session_control.setLayout(session_label_row)
+        self.session_combo = QComboBox()
+        self.session_combo.setObjectName("optionControl")
+        options.addWidget(session_control, 4, 0, 1, 2)
+        options.addWidget(self.session_combo, 5, 0, 1, 2)
+        self._refresh_sessions()
         card_layout.addLayout(options)
 
         self.status_frame = QFrame()
@@ -386,6 +579,7 @@ class MainWindow(QMainWindow):
                     if self.browser_session_check.isChecked()
                     else BrowserCookieSource.NONE
                 ),
+                session_ref=self.session_combo.currentData(),
             )
         except ValidationError as exc:
             self._show_error(str(exc.errors()[0].get("msg", "帖子地址不正确")))
@@ -403,6 +597,7 @@ class MainWindow(QMainWindow):
             request,
             self._output_root,
             self._allowed_domains,
+            self._session_registry_path,
             self,
         )
         self._worker.progress_changed.connect(self._update_progress)
@@ -466,6 +661,25 @@ class MainWindow(QMainWindow):
         self.url_input.clear()
         self.url_input.setFocus()
         self._last_output = None
+
+    def manage_sessions(self) -> None:
+        dialog = SessionManagerDialog(self._session_registry, self)
+        dialog.sessions_changed.connect(self._refresh_sessions)
+        dialog.exec()
+        self._refresh_sessions()
+
+    def _refresh_sessions(self) -> None:
+        selected = self.session_combo.currentData() if hasattr(self, "session_combo") else None
+        self.session_combo.clear()
+        self.session_combo.addItem("不使用登录会话（公开帖子）", None)
+        for record in self._session_registry.list():
+            platform_label = SESSION_PLATFORM_LABELS.get(record.platform, record.platform)
+            self.session_combo.addItem(
+                f"{platform_label} · {record.profile_name} · {record.session_ref}",
+                record.session_ref,
+            )
+            if record.session_ref == selected:
+                self.session_combo.setCurrentIndex(self.session_combo.count() - 1)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.warning(self, "下载没有完成", message)
@@ -641,6 +855,10 @@ QProgressBar { min-height: 5px; max-height: 5px; border: none; border-radius: 2p
 QProgressBar::chunk { border-radius: 2px; background: #d8ff52; }
 QPushButton#secondaryButton, QPushButton#fileButton { min-height: 32px; padding: 0 12px; border: 1px solid #343740; border-radius: 8px; background: #1d2027; color: #d6d8de; font-size: 10px; }
 QPushButton#secondaryButton:hover, QPushButton#fileButton:hover { background: #292c34; }
+QPushButton#inlineButton { min-height: 26px; padding: 0 8px; border: none; background: transparent; color: #d8ff52; font-size: 10px; }
+QLineEdit#sessionInput { min-height: 38px; padding: 0 11px; border: 1px solid #30333c; border-radius: 9px; background: #101217; color: #d7d9de; }
+QLabel#dialogTitle { color: #f5f6f8; font-size: 18px; font-weight: 750; }
+QLabel#dialogCopy { color: #8d929d; font-size: 10px; }
 QLabel#extractor { color: #d8ff52; font-size: 9px; font-weight: 750; }
 QLabel#postTitle { color: #f1f2f4; font-size: 20px; font-weight: 730; }
 QLabel#postMeta { color: #727783; font-size: 10px; }

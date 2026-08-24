@@ -10,6 +10,8 @@ from PySide6.QtWidgets import QApplication
 from social_content_crawler.desktop import (
     DEFAULT_ALLOWED_DOMAINS,
     MainWindow,
+    SESSION_PLATFORM_LABELS,
+    SessionManagerDialog,
     extract_post_url,
     format_bytes,
     format_duration,
@@ -22,11 +24,14 @@ def test_desktop_window_has_download_controls(tmp_path: Path) -> None:
     window = MainWindow(
         output_root=tmp_path,
         allowed_domains=frozenset({"example.com"}),
+        session_registry_path=tmp_path / "sessions.json",
     )
 
     assert "社媒帖子下载器" in window.windowTitle()
     assert window.url_input.placeholderText().startswith("https://")
     assert window.browser_session_check.isChecked()
+    assert window.session_combo.itemText(0) == "不使用登录会话（公开帖子）"
+    assert window.manage_sessions_button.text() == "管理登录会话"
     assert [window.format_combo.itemText(index) for index in range(3)] == [
         "音视频",
         "仅视频",
@@ -35,6 +40,23 @@ def test_desktop_window_has_download_controls(tmp_path: Path) -> None:
     assert window.download_button.text().startswith("开始下载")
     assert window.result_card.isHidden()
     window.close()
+    app.processEvents()
+
+
+def test_session_manager_lists_mainland_platforms_first(tmp_path: Path) -> None:
+    from social_content_crawler.sessions import SessionRegistry
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SessionManagerDialog(SessionRegistry(tmp_path / "sessions.json"))
+
+    assert dialog.windowTitle() == "管理社媒登录会话"
+    assert [
+        dialog.platform_combo.itemData(index)
+        for index in range(dialog.platform_combo.count())
+    ] == ["douyin", "xiaohongshu", "x"]
+    assert dialog.platform_combo.itemText(0) == SESSION_PLATFORM_LABELS["douyin"]
+    assert dialog.platform_combo.itemText(1) == SESSION_PLATFORM_LABELS["xiaohongshu"]
+    dialog.close()
     app.processEvents()
 
 

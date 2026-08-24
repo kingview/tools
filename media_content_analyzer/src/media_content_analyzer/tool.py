@@ -16,7 +16,7 @@ from .ports import AnalysisBackend, AnalysisCache, AuditSink, ToolContext
 
 TOOL_SPEC = ToolSpec(
     name="media.analyze_content",
-    version="1.0.0",
+    version="1.1.1",
     description="Analyze downloaded image, audio, and video artifacts into tags and summaries.",
     input_schema=AnalyzeContentInput.model_json_schema(),
     output_schema=ContentAnalysisOutput.model_json_schema(),
@@ -75,9 +75,12 @@ class MediaContentAnalyzerTool:
             output = await asyncio.to_thread(
                 self._backend.analyze, request, artifacts, work_directory
             )
-            await asyncio.to_thread(
-                self._cache.put, cache_key, output.model_copy(update={"cache_hit": False})
-            )
+            if _is_cacheable(output):
+                await asyncio.to_thread(
+                    self._cache.put,
+                    cache_key,
+                    output.model_copy(update={"cache_hit": False}),
+                )
             return output
         except AnalyzerError as exc:
             error = exc
@@ -183,6 +186,14 @@ def _cache_key(request: AnalyzeContentInput, pipeline_version: str) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _is_cacheable(output: ContentAnalysisOutput) -> bool:
+    """Do not persist transient local-model failures as authoritative analysis."""
+
+    return not any(
+        warning.startswith("Semantic model failed;") for warning in output.warnings
+    )
 
 
 def _hash_model(value: object) -> str:
