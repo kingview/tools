@@ -18,4 +18,4 @@ Tool 定义以各包导出的 Pydantic Schema 和 `ToolSpec` 为权威来源。
 
 ## 本地 Agent Client
 
-[`social_ops_agent`](./social_ops_agent) 是独立桌面 Agent。它用会话式自然语言生成受限 `AgentPlan`，经用户确认后编排 `social.browse_posts`、`social.download_media` 和可选的 `media.process_watermark`。它不是新的平台连接器，也不会绕过各 Tool 的权限、会话、限额和审计边界。
+独立桌面 Agent 位于与本仓库并列的 [`social_agent`](https://github.com/kingview/social_agent) 项目，不属于 `tools` 仓库。它用会话式自然语言生成受限 `AgentPlan`，经用户确认后编排 `social.browse_posts`、`social.download_media` 和可选的 `media.process_watermark`。它不是新的平台连接器，也不会绕过各 Tool 的权限、会话、限额和审计边界。
