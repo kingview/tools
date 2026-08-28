@@ -14,10 +14,19 @@ from .browse_contracts import (
     PostMetrics,
 )
 from .browse_tool import BROWSE_TOOL_SPEC, SocialPostBrowseTool
+from .browser_control import BitBrowserControlBackend, PlaywrightBrowserControlAutomation
+from .browser_control_contracts import (
+    BrowserAction,
+    BrowserInteractiveElement,
+    BrowserOperationInput,
+    BrowserOperationOutput,
+)
+from .browser_control_tool import BROWSER_CONTROL_TOOL_SPEC, BitBrowserControlTool
 from .contracts import BrowserCookieSource, DownloadInput, DownloadOutput, DownloadMode, MediaFormat
 from .runtime import InMemoryAuditSink, LocalRateLimiter
 from .sessions import (
     BitBrowserClient,
+    BrowserDownloadSession,
     BrowserProfile,
     SessionRecord,
     SessionRegistry,
@@ -30,6 +39,14 @@ __all__ = [
     "DownloadInput",
     "BrowserCookieSource",
     "BitBrowserClient",
+    "BrowserDownloadSession",
+    "BitBrowserControlBackend",
+    "BitBrowserControlTool",
+    "BROWSER_CONTROL_TOOL_SPEC",
+    "BrowserAction",
+    "BrowserInteractiveElement",
+    "BrowserOperationInput",
+    "BrowserOperationOutput",
     "BrowserProfile",
     "BrowsePlatform",
     "BrowsePostsInput",
@@ -45,6 +62,7 @@ __all__ = [
     "LocalRateLimiter",
     "MediaFormat",
     "PlaywrightCdpAutomation",
+    "PlaywrightBrowserControlAutomation",
     "PostMetrics",
     "PublicHttpsUrlPolicy",
     "SocialMediaDownloadTool",

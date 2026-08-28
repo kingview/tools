@@ -96,6 +96,7 @@ class DownloadOutput(BaseModel):
     items: list[MediaInfo]
     artifacts: list[DownloadedArtifact]
     output_directory: str | None = None
+    network_route: Literal["direct", "bitbrowser_profile_proxy"] = "direct"
 
 
 class ToolSpec(BaseModel):

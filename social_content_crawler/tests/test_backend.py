@@ -63,7 +63,16 @@ def test_backend_uses_embedded_ytdlp_without_auth_options(
     assert "proxy" not in captured
 
 
-def test_backend_uses_registered_session_cookiefile_and_cleans_it(
+def test_downloader_errors_redact_proxy_credentials() -> None:
+    message = _download_error_message(
+        DownloadError("proxy failed at socks5://user:secret@127.0.0.1:1080")
+    )
+    assert "user" not in message
+    assert "secret" not in message
+    assert "socks5://" not in message
+
+
+def test_backend_uses_registered_session_cookiefile_and_profile_proxy(
     monkeypatch, tmp_path: Path
 ) -> None:
     captured = {}
@@ -72,13 +81,16 @@ def test_backend_uses_registered_session_cookiefile_and_cleans_it(
     class Materialized:
         def __enter__(self):
             cookiefile.write_text("# Netscape HTTP Cookie File\n")
-            return cookiefile
+            return SimpleNamespace(
+                cookiefile=cookiefile,
+                proxy_url="http://proxy-user:proxy-secret@127.0.0.1:7890",
+            )
 
         def __exit__(self, *args):
             cookiefile.unlink(missing_ok=True)
 
     class FakeRegistry:
-        def materialize_cookiefile(self, session_ref, source_urls, working_directory):
+        def materialize_download_session(self, session_ref, source_urls, working_directory):
             assert session_ref.startswith("sess_x_")
             assert source_urls == ["https://x.com/author/status/1"]
             assert working_directory == tmp_path
@@ -102,7 +114,8 @@ def test_backend_uses_registered_session_cookiefile_and_cleans_it(
             return dict(info)
 
     monkeypatch.setattr("social_content_crawler.backend.yt_dlp.YoutubeDL", FakeYoutubeDL)
-    items = YtDlpBackend(session_registry=FakeRegistry()).run(
+    backend = YtDlpBackend(session_registry=FakeRegistry())
+    items = backend.run(
         DownloadInput(
             urls=["https://x.com/author/status/1"],
             mode="metadata_only",
@@ -114,7 +127,55 @@ def test_backend_uses_registered_session_cookiefile_and_cleans_it(
     assert items[0]["id"] == "1"
     assert not cookiefile.exists()
     assert "cookiesfrombrowser" not in captured
+    assert captured["proxy"] == "http://proxy-user:proxy-secret@127.0.0.1:7890"
+    assert backend.last_network_route == "bitbrowser_profile_proxy"
+
+
+def test_registered_session_without_proxy_downloads_directly(monkeypatch, tmp_path: Path) -> None:
+    captured = {}
+    cookiefile = tmp_path / ".temporary-session.cookies.txt"
+
+    class Materialized:
+        def __enter__(self):
+            cookiefile.write_text("# Netscape HTTP Cookie File\n")
+            return SimpleNamespace(cookiefile=cookiefile, proxy_url=None)
+
+        def __exit__(self, *args):
+            cookiefile.unlink(missing_ok=True)
+
+    class FakeRegistry:
+        def materialize_download_session(self, *args):
+            return Materialized()
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, url, download):
+            return {"id": "1", "extractor_key": "Twitter", "webpage_url": url}
+
+        def sanitize_info(self, info):
+            return dict(info)
+
+    monkeypatch.setattr("social_content_crawler.backend.yt_dlp.YoutubeDL", FakeYoutubeDL)
+    backend = YtDlpBackend(session_registry=FakeRegistry())
+    backend.run(
+        DownloadInput(
+            urls=["https://x.com/author/status/1"],
+            mode="metadata_only",
+            session_ref="sess_x_abcdefghijklmnopqrstuvwx",
+        ),
+        tmp_path,
+    )
+
     assert "proxy" not in captured
+    assert backend.last_network_route == "direct"
 
 
 def test_backend_registers_optional_progress_hook(monkeypatch, tmp_path: Path) -> None:

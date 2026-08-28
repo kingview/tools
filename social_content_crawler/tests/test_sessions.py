@@ -11,6 +11,7 @@ from social_content_crawler.errors import CrawlerError, ErrorCode
 from social_content_crawler.sessions import (
     BitBrowserClient,
     SessionRegistry,
+    _proxy_url_from_profile_detail,
     validate_loopback_api_url,
 )
 
@@ -131,6 +132,64 @@ def test_session_cookiefile_is_x_only_and_always_deleted(tmp_path: Path) -> None
         if os.name != "nt":
             assert S_IMODE(materialized.stat().st_mode) == 0o600
     assert cookiefile is not None and not cookiefile.exists()
+
+
+def test_profile_proxy_is_encoded_for_downloader_without_logging_parts() -> None:
+    proxy_url = _proxy_url_from_profile_detail(
+        {
+            "proxyType": "http",
+            "host": "proxy.example.com",
+            "port": 8080,
+            "proxyUserName": "team user",
+            "proxyPassword": "p@ss/word",
+        }
+    )
+    assert proxy_url == "http://team%20user:p%40ss%2Fword@proxy.example.com:8080"
+    assert _proxy_url_from_profile_detail({"proxyType": "noproxy"}) is None
+
+
+def test_download_session_requires_profile_proxy_and_cleans_cookiefile(tmp_path: Path) -> None:
+    def proxy_transport(path: str, payload: dict):
+        response = _transport(path, payload)
+        if path == "/browser/detail":
+            response["data"].update(
+                {
+                    "proxyType": "socks5",
+                    "host": "127.0.0.1",
+                    "port": 1080,
+                    "proxyUserName": "proxy-user",
+                    "proxyPassword": "proxy-password",
+                }
+            )
+        return response
+
+    registry = SessionRegistry(
+        tmp_path / "proxy.sessions.json",
+        client_factory=lambda api_url: BitBrowserClient(api_url, transport=proxy_transport),
+    )
+    record = registry.register_bitbrowser_x("http://127.0.0.1:54345", PROFILE_ID)
+    cookiefile = None
+    with registry.materialize_download_session(
+        record.session_ref,
+        ["https://x.com/example/status/1"],
+        tmp_path,
+    ) as materialized:
+        cookiefile = materialized.cookiefile
+        assert materialized.proxy_url == "socks5://proxy-user:proxy-password@127.0.0.1:1080"
+        assert materialized.cookiefile.is_file()
+    assert cookiefile is not None and not cookiefile.exists()
+
+
+def test_download_session_allows_profile_without_proxy(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    record = registry.register_bitbrowser_x("http://127.0.0.1:54345", PROFILE_ID)
+    with registry.materialize_download_session(
+        record.session_ref,
+        ["https://x.com/example/status/1"],
+        tmp_path,
+    ) as materialized:
+        assert materialized.proxy_url is None
+        assert materialized.cookiefile.is_file()
 
 
 def test_x_session_cannot_be_used_for_another_platform(tmp_path: Path) -> None:

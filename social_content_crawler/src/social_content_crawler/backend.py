@@ -11,13 +11,13 @@ from html import unescape
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 
 import imageio_ffmpeg
 import yt_dlp
 from playwright.sync_api import sync_playwright
 from yt_dlp.utils import DownloadError
+from yt_dlp.networking import Request as YtDlpRequest
 
 from .contracts import BrowserCookieSource, DownloadInput, DownloadMode, MediaFormat
 from .errors import CrawlerError, ErrorCode
@@ -63,6 +63,7 @@ class YtDlpBackend:
         self._progress_callback = progress_callback
         self._cookie_cache_path = (cookie_cache_path or _default_cookie_cache_path()).expanduser()
         self._session_registry = session_registry
+        self.last_network_route = "direct"
 
     def run(self, request: DownloadInput, output_directory: Path) -> list[dict[str, Any]]:
         if request.session_ref:
@@ -71,21 +72,32 @@ class YtDlpBackend:
                     ErrorCode.CONFIGURATION_ERROR,
                     "当前 Tool Executor 没有配置 session_ref 注册表。",
                 )
-            session_context = self._session_registry.materialize_cookiefile(
+            session_context = self._session_registry.materialize_download_session(
                 request.session_ref,
                 [str(url) for url in request.urls],
                 output_directory,
             )
         else:
             session_context = nullcontext(None)
-        with session_context as session_cookiefile:
-            return self._run(request, output_directory, session_cookiefile)
+        with session_context as session:
+            self.last_network_route = (
+                "bitbrowser_profile_proxy"
+                if session is not None and session.proxy_url is not None
+                else "direct"
+            )
+            return self._run(
+                request,
+                output_directory,
+                session.cookiefile if session is not None else None,
+                session.proxy_url if session is not None else None,
+            )
 
     def _run(
         self,
         request: DownloadInput,
         output_directory: Path,
         session_cookiefile: Path | None,
+        session_proxy_url: str | None,
     ) -> list[dict[str, Any]]:
         download_post_images = _supports_image_posts(request)
         ffmpeg_executable = _ffmpeg_executable()
@@ -124,6 +136,8 @@ class YtDlpBackend:
             base_options["ffmpeg_location"] = ffmpeg_executable
         if session_cookiefile is not None:
             base_options["cookiefile"] = str(session_cookiefile)
+        if session_proxy_url is not None:
+            base_options["proxy"] = session_proxy_url
         if self._progress_callback is not None:
             base_options["progress_hooks"] = [self._progress_callback]
         collected: list[dict[str, Any]] = []
@@ -150,7 +164,7 @@ class YtDlpBackend:
                         raise
                     else:
                         safe_info = _douyin_public_page_fallback(
-                            str(source_url), request, output_directory
+                            str(source_url), request, output_directory, session_proxy_url
                         )
                 if not safe_info:
                     continue
@@ -324,12 +338,16 @@ def _is_douyin_url(value: str) -> bool:
 
 
 def _douyin_public_page_fallback(
-    page_url: str, request: DownloadInput, output_directory: Path
+    page_url: str,
+    request: DownloadInput,
+    output_directory: Path,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     html, resolved_url, runtime_media_url = _render_public_page(
         page_url,
         _douyin_video_id(page_url),
         request.request_timeout_seconds,
+        proxy_url,
     )
     video_id = _douyin_video_id(resolved_url) or _extract_douyin_video_id(html)
     if not video_id:
@@ -352,6 +370,7 @@ def _douyin_public_page_fallback(
             page_url,
             max_bytes=request.max_file_size_mb * 1024 * 1024,
             timeout=request.request_timeout_seconds,
+            proxy_url=proxy_url,
         )
         if request.media_format is MediaFormat.AUDIO:
             ffmpeg = _ffmpeg_executable()
@@ -424,7 +443,10 @@ def _extract_douyin_video_id(html: str) -> str | None:
 
 
 def _render_public_page(
-    page_url: str, video_id: str | None, timeout: float
+    page_url: str,
+    video_id: str | None,
+    timeout: float,
+    proxy_url: str | None = None,
 ) -> tuple[str, str, str | None]:
     timeout_ms = int(timeout * 1000)
     last_error: Exception | None = None
@@ -432,7 +454,13 @@ def _render_public_page(
         for executable in _chromium_executables():
             browser = None
             try:
-                browser = playwright.chromium.launch(executable_path=str(executable), headless=True)
+                launch_options: dict[str, Any] = {
+                    "executable_path": str(executable),
+                    "headless": True,
+                }
+                if proxy_url:
+                    launch_options["proxy"] = _playwright_proxy(proxy_url)
+                browser = playwright.chromium.launch(**launch_options)
                 page = browser.new_page()
                 page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 resolved_id = video_id or _douyin_video_id(page.url)
@@ -511,27 +539,52 @@ def _download_public_media(
     *,
     max_bytes: int,
     timeout: float,
+    proxy_url: str | None = None,
 ) -> None:
-    request = Request(
+    request = YtDlpRequest(
         media_url,
         headers={"Referer": referer, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     )
     temporary = destination.with_suffix(destination.suffix + ".part")
     total = 0
     try:
-        with urlopen(request, timeout=timeout) as response, temporary.open("wb") as output:
-            length = response.headers.get("Content-Length")
-            if length and int(length) > max_bytes:
-                raise DownloadError("Douyin media exceeds the configured file size limit")
-            while chunk := response.read(1024 * 1024):
-                total += len(chunk)
-                if total > max_bytes:
+        options: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": timeout,
+            "logger": _QuietLogger(),
+        }
+        if proxy_url:
+            options["proxy"] = proxy_url
+        with yt_dlp.YoutubeDL(options) as downloader:
+            with downloader.urlopen(request) as response, temporary.open("wb") as output:
+                length = response.headers.get("Content-Length")
+                if length and int(length) > max_bytes:
                     raise DownloadError("Douyin media exceeds the configured file size limit")
-                output.write(chunk)
+                while chunk := response.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise DownloadError("Douyin media exceeds the configured file size limit")
+                    output.write(chunk)
         temporary.replace(destination)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _playwright_proxy(proxy_url: str) -> dict[str, str]:
+    parsed = urlsplit(proxy_url)
+    if parsed.scheme not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname:
+        raise DownloadError("BitBrowser returned an invalid proxy URL")
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    proxy: dict[str, str] = {"server": f"{parsed.scheme}://{host}:{parsed.port}"}
+    if parsed.username:
+        proxy["username"] = unquote(parsed.username)
+    if parsed.password:
+        proxy["password"] = unquote(parsed.password)
+    return proxy
 
 
 def _browser_cookie_candidates(source: BrowserCookieSource) -> list[str]:
@@ -653,7 +706,7 @@ def _flatten_info(info: dict[str, Any]) -> Iterable[dict[str, Any]]:
 
 
 def _redact_urls(message: str) -> str:
-    return re.sub(r"https?://\S+", "[url]", message)
+    return re.sub(r"[a-z][a-z0-9+.-]*://\S+", "[url]", message, flags=re.IGNORECASE)
 
 
 def _download_error_message(exc: DownloadError) -> str:

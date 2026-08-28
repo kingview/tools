@@ -145,8 +145,9 @@ class SessionManagerDialog(QDialog):
         title = QLabel("注册已手动登录的比特浏览器 Profile")
         title.setObjectName("dialogTitle")
         copy = QLabel(
-            "PostDrop 会生成 session_ref。下载或浏览时临时读取该 Profile 对应平台的 Cookie，用完即删除；"
-            "不会读取密码，也不会修改代理或指纹。"
+            "PostDrop 会生成 session_ref。下载时临时读取该 Profile 对应平台的 Cookie，"
+            "并让媒体流量使用该窗口配置的代理（noproxy 时直连）；Cookie 用完即删除。不会读取密码，"
+            "也不会修改代理或指纹。"
         )
         copy.setObjectName("dialogCopy")
         copy.setWordWrap(True)
@@ -884,6 +885,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--output-root")
+    parser.add_argument("--manage-sessions-only", action="store_true")
     arguments, qt_arguments = parser.parse_known_args()
     app = QApplication([sys.argv[0], *qt_arguments])
     app.setApplicationName(APP_NAME)
@@ -892,6 +894,11 @@ def main() -> None:
     app.setFont(QFont("Arial", 11))
     app.setStyleSheet(STYLESHEET)
     output_root = Path(arguments.output_root).expanduser() if arguments.output_root else None
+    if arguments.manage_sessions_only:
+        registry = SessionRegistry(default_session_registry_path())
+        dialog = SessionManagerDialog(registry)
+        dialog.exec()
+        return
     window = MainWindow(output_root=output_root)
     window.show()
     sys.exit(app.exec())

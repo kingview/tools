@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "com.socialagent.social-content",
+  "name": "社媒浏览与下载",
+  "version": "0.6.1",
+  "description": "通过比特浏览器会话浏览抖音、小红书和 X，并下载帖子媒体与文案。",
+  "publisher": "Social Agent",
+  "platforms": ["macos-arm64", "windows-x64", "linux-x64"],
+  "runtime": {
+    "module": "social_content_crawler.mcp_server",
+    "gui_module": "social_content_crawler.desktop",
+    "install_extras": ["plugin"]
+  },
+  "tools": [
+    {"name": "browse_posts"},
+    {"name": "browser_operate"},
+    {"name": "download_media"}
+  ],
+  "permissions": ["network", "browser-session", "write-agent-output"]
+}

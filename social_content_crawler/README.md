@@ -1,11 +1,32 @@
 # PostDrop / social.download_media
 
-项目提供两个相互独立的社媒读取 Tool：
+项目提供三个相互独立的社媒 Tool：
 
-1. `social.browse_posts`：通过已授权的比特浏览器会话浏览抖音、小红书或 X，搜索并获取帖子 URL 与元数据。
-2. `social.download_media`：根据帖子 URL 下载媒体；同时提供 PostDrop 桌面 App。
+1. `browser.operate`：在已授权的比特浏览器会话中观察页面、导航、点击、输入搜索词、按键、滚动和翻页。
+2. `social.browse_posts`：通过已授权的比特浏览器会话浏览抖音、小红书或 X，搜索并获取帖子 URL 与元数据。
+3. `social.download_media`：根据帖子 URL 下载媒体；同时提供 PostDrop 桌面 App。
 
-两个 Tool 使用独立契约和 Backend，共用 `SessionRegistry`、错误码、限流与审计基础设施。
+三个 Tool 使用独立契约和 Backend，共用 `SessionRegistry`、错误码、限流与审计基础设施。
+
+## browser.operate
+
+该 Tool 使用 `session_ref` 找到比特浏览器 Profile，通过官方 Local API 的
+`/browser/open` 获取本机 CDP 地址，再由 Playwright 操作可见标签页。支持动作：
+
+- `observe`：返回页面标题、正文摘要和最多 100 个可交互元素，元素以短期 `element_ref` 标识。
+- `navigate`：打开公开、无凭据的 HTTPS 页面。
+- `click`、`input`：可使用 `element_ref`、CSS selector、ARIA role/name 或精确文本定位。
+- `press`、`scroll`：支持 Enter、PageUp/PageDown、方向键等受限按键和上下滚动。
+- `back`、`forward`、`reload`、`wait`：完成常见分页与页面状态等待。
+
+推荐先 `observe`，再用返回的 `element_ref` 点击或输入。每个 `session_ref` 串行执行，
+标签页和元素引用仅保存在当前进程内。Tool 拒绝密码和文件输入控件，并在点击前拦截
+发布、点赞、评论、关注、交易、删除等外部写操作；它只用于搜索、浏览和翻页。
+
+比特浏览器 Local API 本身负责 Profile 生命周期和代理/指纹设置。当前 Tool 为降低风险
+只调用 `/browser/open`，不调用 `/browser/add`、`/browser/modify`、`/browser/close`、
+`/browser/delete` 或批量代理修改接口；页面 DOM 操作不是 Local API 端点，而是在其返回的
+CDP 连接中完成。
 
 ## social.browse_posts
 
@@ -245,7 +266,7 @@ request = DownloadInput(
 )
 ```
 
-Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码、代理或指纹参数。注册表只保存平台、引用、Profile ID、本机 API 地址和显示名称，不保存 Cookie。每次下载时，Backend 通过比特浏览器本地 API 读取该 Profile 对应平台的 Cookie，筛掉其他域名，写入权限为仅当前用户的临时文件；`yt-dlp` 返回或报错后都会删除临时文件。三类引用前缀分别为 `sess_douyin_`、`sess_xhs_`、`sess_x_`，不能跨平台使用。
+Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码、代理或指纹参数。注册表只保存平台、引用、Profile ID、本机 API 地址和显示名称，不保存 Cookie 或代理凭据。每次登录态下载前，Backend 打开对应比特浏览器窗口，使其应用当前代理配置；随后从本地 API 在进程内读取该 Profile 对应平台的 Cookie 和 HTTP/HTTPS/SOCKS5 代理，把 Cookie 写入权限为仅当前用户的临时文件，并把同一个代理注入 `yt-dlp`、图片下载和抖音后备下载链路。代理账号和密码不进入 Tool 输出、日志、注册表或审计事件；下载成功或失败后都会删除临时 Cookie 文件。Profile 配置代理时结果标记 `bitbrowser_profile_proxy`；Profile 为 `noproxy` 时直接使用本机网络并标记 `direct`。三类引用前缀分别为 `sess_douyin_`、`sess_xhs_`、`sess_x_`，不能跨平台使用。
 
 注册和下载只读取 `/health`、`/browser/list`、`/browser/detail`；浏览 Tool 额外调用 `/browser/open` 获取本机 CDP 地址并新建临时标签页。PostDrop 不自动登录、不关闭 Profile，也不修改 Profile 的代理和指纹。登录失效时会返回 `session_reauth_required`，需用户在对应 Profile 中重新手动登录并重新注册。
 
@@ -266,7 +287,8 @@ Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码
 
 | 名称 | 版本 | 类型 | 输入 | 输出 |
 |---|---:|---|---|---|
+| `browser.operate` | `1.0.0` | account_control | `BrowserOperationInput` | `BrowserOperationOutput` |
 | `social.browse_posts` | `1.0.0` | read | `BrowsePostsInput` | `BrowsePostsOutput` |
-| `social.download_media` | `1.6.0` | read | `DownloadInput` | `DownloadOutput` |
+| `social.download_media` | `1.7.0` | read | `DownloadInput` | `DownloadOutput` |
 
 `social.download_media` 的 Dry Run 为 `mode="metadata_only"`；`social.browse_posts` 没有 Dry Run，因为它本身只执行受限只读导航。

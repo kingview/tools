@@ -28,8 +28,11 @@ from .ports import AuditSink, DownloaderBackend, RateLimiter, ToolContext, UrlPo
 
 TOOL_SPEC = ToolSpec(
     name="social.download_media",
-    version="1.6.0",
-    description="Extract metadata or download social-media media, optionally using a registered local session.",
+    version="1.7.0",
+    description=(
+        "Extract metadata or download social-media media; registered BitBrowser "
+        "sessions use the Profile's proxy route as well as its platform cookies."
+    ),
     input_schema=DownloadInput.model_json_schema(),
     output_schema=DownloadOutput.model_json_schema(),
     category="read",
@@ -106,6 +109,9 @@ class SocialMediaDownloadTool:
                 artifacts=artifacts,
                 output_directory=(
                     str(output_directory) if request.mode is DownloadMode.DOWNLOAD else None
+                ),
+                network_route=(
+                    str(getattr(self._backend, "last_network_route", "direct"))
                 ),
             )
             return output

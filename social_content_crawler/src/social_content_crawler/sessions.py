@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
 from typing import Any, Callable, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .errors import CrawlerError, ErrorCode
@@ -62,6 +62,14 @@ class SessionRecord:
     api_url: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserDownloadSession:
+    """Ephemeral download material. Proxy credentials never leave this process."""
+
+    cookiefile: Path
+    proxy_url: str | None
 
 
 class BitBrowserClient:
@@ -282,6 +290,36 @@ class SessionRegistry:
         finally:
             cookiefile.unlink(missing_ok=True)
 
+    @contextmanager
+    def materialize_download_session(
+        self,
+        session_ref: str,
+        source_urls: list[str],
+        working_directory: Path,
+    ) -> Iterator[BrowserDownloadSession]:
+        """Materialize platform cookies and the Profile's active proxy route."""
+        record = self.get(session_ref)
+        platform = validate_session_platform(record.platform)
+        if not source_urls or not all(_is_platform_url(url, platform) for url in source_urls):
+            raise CrawlerError(
+                ErrorCode.INVALID_REQUEST,
+                f"该 session_ref 仅能用于 {_PLATFORM_LABEL[platform]} 帖子地址。",
+            )
+        client = self._client_factory(record.api_url)
+        # Opening the Profile first makes BitBrowser apply its configured proxy
+        # and keeps browser navigation and media download on the same route.
+        client.open_profile(record.profile_id)
+        detail = client.profile_detail(record.profile_id)
+        cookies = _platform_cookie_dicts(_cookies_from_profile_detail(detail), platform)
+        _require_platform_login(cookies, platform)
+        proxy_url = _proxy_url_from_profile_detail(detail)
+        cookiefile = working_directory / f".postdrop-session-{secrets.token_hex(8)}.cookies.txt"
+        try:
+            _write_cookiejar(cookiefile, cookies)
+            yield BrowserDownloadSession(cookiefile=cookiefile, proxy_url=proxy_url)
+        finally:
+            cookiefile.unlink(missing_ok=True)
+
     def _write(self, records: list[SessionRecord]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{secrets.token_hex(6)}.tmp")
@@ -380,6 +418,72 @@ def _platform_cookie_dicts(
             if item.get("name") and item.get("value") is not None:
                 result.append(item)
     return result
+
+
+def _cookies_from_profile_detail(detail: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = detail.get("cookie", [])
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "[]")
+        except json.JSONDecodeError as exc:
+            raise CrawlerError(ErrorCode.MALFORMED_RESPONSE, "比特浏览器 Cookie 数据格式无效。") from exc
+    if not isinstance(raw, list):
+        raise CrawlerError(ErrorCode.MALFORMED_RESPONSE, "比特浏览器 Cookie 数据格式无效。")
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _proxy_url_from_profile_detail(detail: dict[str, Any]) -> str | None:
+    candidates = [detail]
+    for key in ("proxy", "proxyInfo"):
+        nested = detail.get(key)
+        if isinstance(nested, dict):
+            candidates.insert(0, nested)
+    proxy: dict[str, Any] = {}
+    for candidate in candidates:
+        if candidate.get("proxyType") or candidate.get("host") or candidate.get("proxyHost"):
+            proxy = candidate
+            break
+    raw_type = str(
+        proxy.get("proxyType")
+        or proxy.get("type")
+        or proxy.get("proxyAgreementType")
+        or ""
+    ).strip().lower()
+    if raw_type in {"", "noproxy", "none", "direct"}:
+        return None
+    scheme = {
+        "http": "http",
+        "https": "https",
+        "socks5": "socks5",
+        "socks5h": "socks5h",
+        "911s5": "socks5",
+    }.get(raw_type)
+    if scheme is None:
+        raise CrawlerError(
+            ErrorCode.CONFIGURATION_ERROR,
+            f"当前下载器暂不支持比特浏览器代理类型 {raw_type!r}。",
+        )
+    host = str(proxy.get("host") or proxy.get("proxyHost") or "").strip()
+    raw_port = proxy.get("port", proxy.get("proxyPort"))
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as exc:
+        raise CrawlerError(ErrorCode.CONFIGURATION_ERROR, "比特浏览器代理端口无效。") from exc
+    if not host or any(character in host for character in "/@?#") or not 1 <= port <= 65535:
+        raise CrawlerError(ErrorCode.CONFIGURATION_ERROR, "比特浏览器代理地址无效。")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    username = str(
+        proxy.get("proxyUserName") or proxy.get("username") or proxy.get("userName") or ""
+    )
+    password = str(proxy.get("proxyPassword") or proxy.get("password") or "")
+    credentials = ""
+    if username:
+        credentials = quote(username, safe="")
+        if password:
+            credentials += f":{quote(password, safe='')}"
+        credentials += "@"
+    return f"{scheme}://{credentials}{host}:{port}"
 
 
 def _require_platform_login(cookies: list[dict[str, Any]], platform: str) -> None:

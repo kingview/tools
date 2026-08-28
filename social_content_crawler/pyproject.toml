@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-content-crawler"
-version = "0.4.0"
+version = "0.6.1"
 description = "Contract-first social post browsing and media downloading for local agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,16 +12,18 @@ dependencies = [
     "imageio-ffmpeg==0.6.0",
     "playwright>=1.58,<2",
     "pydantic>=2.10,<3",
-    "pyside6==6.11.2",
     "yt-dlp==2026.7.4",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
 build = ["pyinstaller>=6.16"]
+desktop = ["pyside6-essentials==6.11.2"]
+plugin = ["mcp>=1.26,<2", "pyside6-essentials==6.11.2"]
 
 [project.scripts]
 social-content-downloader = "social_content_crawler.desktop:main"
+social-content-crawler-mcp = "social_content_crawler.mcp_server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
