@@ -20,6 +20,8 @@ class ErrorCode(StrEnum):
     SESSION_REAUTH_REQUIRED = "session_reauth_required"
     SESSION_BUSY = "session_busy"
     BROWSE_FAILED = "browse_failed"
+    APPROVAL_REQUIRED = "approval_required"
+    PUBLISH_FAILED = "publish_failed"
 
 
 class CrawlerError(Exception):

@@ -7,6 +7,7 @@ from stat import S_IMODE
 
 import pytest
 
+import social_content_crawler.sessions as sessions_module
 from social_content_crawler.errors import CrawlerError, ErrorCode
 from social_content_crawler.sessions import (
     BitBrowserClient,
@@ -266,3 +267,40 @@ def test_registers_mainland_platform_sessions(
     assert record.session_ref.startswith(prefix)
     assert registry.validate_session(record.session_ref, platform) == record
     assert "platform-secret" not in registry.path.read_text(encoding="utf-8")
+
+
+def test_registration_uses_live_cookies_when_open_profile_snapshot_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stale_transport(path: str, payload: dict):
+        response = _transport(path, payload)
+        if path == "/browser/detail":
+            response["data"]["cookie"] = "[]"
+        return response
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_read_live_profile_cookies",
+        lambda endpoint: [
+            {
+                "domain": ".xiaohongshu.com",
+                "name": "web_session",
+                "value": "live-only-secret",
+                "path": "/",
+                "secure": True,
+            }
+        ],
+    )
+    registry = SessionRegistry(
+        tmp_path / "live.sessions.json",
+        client_factory=lambda api_url: BitBrowserClient(api_url, transport=stale_transport),
+    )
+
+    record = registry.register_bitbrowser(
+        "xiaohongshu", "http://127.0.0.1:54345", PROFILE_ID
+    )
+
+    assert record.session_ref.startswith("sess_xhs_")
+    assert registry.validate_session(record.session_ref, "xiaohongshu") == record
+    assert "live-only-secret" not in registry.path.read_text(encoding="utf-8")

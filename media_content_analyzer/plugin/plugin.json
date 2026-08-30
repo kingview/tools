@@ -2,14 +2,14 @@
   "schema_version": 1,
   "id": "com.socialagent.media-content",
   "name": "媒体内容分析与修复",
-  "version": "0.10.8",
+  "version": "0.10.9",
   "description": "分析图片、音频和视频，生成标签、摘要与文案，并检测和修复视频水印。",
   "publisher": "Social Agent",
   "platforms": ["macos-arm64", "windows-x64", "linux-x64"],
   "runtime": {
     "module": "media_content_analyzer.mcp_server",
     "gui_module": "media_content_analyzer.desktop",
-    "install_extras": ["plugin", "image", "repair"]
+    "install_extras": ["plugin", "image", "video", "ocr", "repair"]
   },
   "tools": [
     {"name": "analyze_content"},

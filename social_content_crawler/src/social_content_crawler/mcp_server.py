@@ -21,13 +21,17 @@ from .runtime import InMemoryAuditSink, LocalRateLimiter
 from .sessions import SessionRegistry
 from .tool import SocialMediaDownloadTool
 from .url_policy import PublicHttpsUrlPolicy
+from .x_publish import XPublishBackend
+from .x_publish_contracts import XPublishInput
+from .x_publish_tool import XPublishTool
 
 
 mcp = FastMCP(
     "social-content",
     instructions=(
-        "Read-only social browsing and local downloading. Never expose session "
-        "cookies, proxy credentials, passwords, verification codes, or fingerprints."
+        "Social browsing, local downloading, and explicitly approved one-time X publishing. "
+        "Never expose session cookies, proxy credentials, passwords, verification codes, "
+        "fingerprints, or publication approval tokens."
     ),
 )
 
@@ -55,6 +59,15 @@ class Runtime:
             url_policy=PublicHttpsUrlPolicy(),
             output_root=self.output_root,
             allowed_domains=default_allowed_domains(),
+        )
+        self.publish_x = XPublishTool(
+            backend=XPublishBackend(
+                session_registry=registry,
+                output_root=self.output_root,
+                expected_approval_token=os.getenv("SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN", ""),
+            ),
+            audit_sink=audit,
+            rate_limiter=limiter,
         )
 
     @staticmethod
@@ -134,6 +147,26 @@ async def download_media(
         max_total_size_mb=max_total_size_mb,
     )
     result = await runtime().download.execute(request, runtime().context())
+    return result.model_dump(mode="json")
+
+
+@mcp.tool()
+async def publish_x_post(
+    session_ref: str,
+    text: str,
+    approval_token: str,
+    media_paths: list[str] | None = None,
+    timeout_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Publish one user-approved X post; never retry an unknown result."""
+    request = XPublishInput(
+        session_ref=session_ref,
+        text=text,
+        approval_token=approval_token,
+        media_paths=media_paths or [],
+        timeout_seconds=timeout_seconds,
+    )
+    result = await runtime().publish_x.execute(request, runtime().context())
     return result.model_dump(mode="json")
 
 

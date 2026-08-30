@@ -1,12 +1,13 @@
 # PostDrop / social.download_media
 
-项目提供三个相互独立的社媒 Tool：
+项目提供四个相互独立的社媒 Tool：
 
 1. `browser.operate`：在已授权的比特浏览器会话中观察页面、导航、点击、输入搜索词、按键、滚动和翻页。
 2. `social.browse_posts`：通过已授权的比特浏览器会话浏览抖音、小红书或 X，搜索并获取帖子 URL 与元数据。
 3. `social.download_media`：根据帖子 URL 下载媒体；同时提供 PostDrop 桌面 App。
+4. `social.publish_x_post`：在用户确认 Agent 高风险计划后，通过已登录的比特浏览器发布一条 X 帖子。
 
-三个 Tool 使用独立契约和 Backend，共用 `SessionRegistry`、错误码、限流与审计基础设施。
+四个 Tool 使用独立契约和 Backend，共用 `SessionRegistry`、错误码、限流与审计基础设施。
 
 ## browser.operate
 
@@ -22,6 +23,22 @@
 推荐先 `observe`，再用返回的 `element_ref` 点击或输入。每个 `session_ref` 串行执行，
 标签页和元素引用仅保存在当前进程内。Tool 拒绝密码和文件输入控件，并在点击前拦截
 发布、点赞、评论、关注、交易、删除等外部写操作；它只用于搜索、浏览和翻页。
+
+## social.publish_x_post
+
+该 Tool 不使用 X 官方 API，而是用 X 专属 `session_ref` 打开已登录的比特浏览器
+Profile，通过 Playwright 进入 `https://x.com/compose/post`，填写最终文案、可选上传最多
+4 个图片或视频并提交。通用 `browser.operate` 仍然禁止发布按钮和文件输入，不能代替或
+绕过该专用 Tool。
+
+发布属于不可逆外部写操作，因此执行条件固定为：
+
+- 用户文字明确要求发布到 X，并选择已登录的 X 会话。
+- Social Agent 先展示动态计划，再由用户在独立高风险确认框中确认。
+- 每次确认签发随机一次性令牌，核心 MCP 和插件各验证一次，并在浏览器操作前消费。
+- 一次计划最多发布一条；成功、失败或 `unknown` 都不会自动重试。
+- 发布媒体必须来自 Social Agent 输出目录，防止上传任意本地文件。
+- Tool 审计记录输入/输出摘要，但不记录一次性令牌。
 
 比特浏览器 Local API 本身负责 Profile 生命周期和代理/指纹设置。当前 Tool 为降低风险
 只调用 `/browser/open`，不调用 `/browser/add`、`/browser/modify`、`/browser/close`、
@@ -86,7 +103,7 @@ async def browse() -> None:
 asyncio.run(browse())
 ```
 
-浏览 Backend 只调用比特浏览器 `/browser/open` 获取本机 CDP 地址，然后由 Playwright 新建临时标签页完成只读导航。采集完成后关闭临时标签页，保留 Profile 进程。它不会自动登录、提交表单、点赞、转发、关注、发布内容，也不会调用修改代理、指纹或 Cookie 的接口。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
+浏览 Backend 只调用比特浏览器 `/browser/open` 获取本机 CDP 地址，然后由 Playwright 新建临时标签页完成只读导航。采集完成后关闭临时标签页，保留 Profile 进程。它不会自动登录、提交表单、点赞、转发或关注，也不会调用修改代理、指纹或 Cookie 的接口。发布只能经由独立 `social.publish_x_post` 和一次性授权完成。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
 
 实现分层参考了 [MediaCrawler](https://github.com/NanmiCoder/MediaCrawler) 的“平台适配器 + Playwright/CDP + 登录态复用”思路，但没有复制其签名算法、私有接口调用或源代码。MediaCrawler 使用[非商用学习许可证](https://github.com/NanmiCoder/MediaCrawler/blob/main/LICENSE)，本项目的实现和使用必须独立遵守目标平台规则、账号授权边界及适用法律。
 
@@ -97,6 +114,7 @@ social.browse_posts
 → social.download_media
 → media.analyze_content
 → media.generate_post_copy
+→ （可选，用户确认）social.publish_x_post
 ```
 
 ## 桌面 App
@@ -268,7 +286,7 @@ request = DownloadInput(
 
 Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码、代理或指纹参数。注册表只保存平台、引用、Profile ID、本机 API 地址和显示名称，不保存 Cookie 或代理凭据。每次登录态下载前，Backend 打开对应比特浏览器窗口，使其应用当前代理配置；随后从本地 API 在进程内读取该 Profile 对应平台的 Cookie 和 HTTP/HTTPS/SOCKS5 代理，把 Cookie 写入权限为仅当前用户的临时文件，并把同一个代理注入 `yt-dlp`、图片下载和抖音后备下载链路。代理账号和密码不进入 Tool 输出、日志、注册表或审计事件；下载成功或失败后都会删除临时 Cookie 文件。Profile 配置代理时结果标记 `bitbrowser_profile_proxy`；Profile 为 `noproxy` 时直接使用本机网络并标记 `direct`。三类引用前缀分别为 `sess_douyin_`、`sess_xhs_`、`sess_x_`，不能跨平台使用。
 
-注册和下载只读取 `/health`、`/browser/list`、`/browser/detail`；浏览 Tool 额外调用 `/browser/open` 获取本机 CDP 地址并新建临时标签页。PostDrop 不自动登录、不关闭 Profile，也不修改 Profile 的代理和指纹。登录失效时会返回 `session_reauth_required`，需用户在对应 Profile 中重新手动登录并重新注册。
+注册和下载只读取 `/health`、`/browser/list`、`/browser/detail`；浏览与 X 发布 Tool 额外调用 `/browser/open` 获取本机 CDP 地址。PostDrop 不自动登录、不关闭 Profile，也不修改 Profile 的代理和指纹。登录失效时会返回 `session_reauth_required`，需用户在对应 Profile 中重新手动登录并重新注册。
 
 ## 安全边界
 
@@ -290,5 +308,6 @@ Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码
 | `browser.operate` | `1.0.0` | account_control | `BrowserOperationInput` | `BrowserOperationOutput` |
 | `social.browse_posts` | `1.0.0` | read | `BrowsePostsInput` | `BrowsePostsOutput` |
 | `social.download_media` | `1.7.0` | read | `DownloadInput` | `DownloadOutput` |
+| `social.publish_x_post` | `1.0.0` | external_write | `XPublishInput` | `XPublishOutput` |
 
-`social.download_media` 的 Dry Run 为 `mode="metadata_only"`；`social.browse_posts` 没有 Dry Run，因为它本身只执行受限只读导航。
+`social.download_media` 的 Dry Run 为 `mode="metadata_only"`；`social.browse_posts` 没有 Dry Run，因为它本身只执行受限只读导航。`social.publish_x_post` 不提供 Dry Run，且 `max_retries=0`。

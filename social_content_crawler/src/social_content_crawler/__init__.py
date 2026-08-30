@@ -34,6 +34,9 @@ from .sessions import (
 )
 from .tool import TOOL_SPEC, SocialMediaDownloadTool
 from .url_policy import PublicHttpsUrlPolicy
+from .x_publish import PlaywrightXPublishAutomation, XPublishBackend
+from .x_publish_contracts import XPublishInput, XPublishOutput
+from .x_publish_tool import X_PUBLISH_TOOL_SPEC, XPublishTool
 
 __all__ = [
     "DownloadInput",
@@ -73,4 +76,10 @@ __all__ = [
     "TOOL_SPEC",
     "YtDlpBackend",
     "XPostBrowserBackend",
+    "PlaywrightXPublishAutomation",
+    "XPublishBackend",
+    "XPublishInput",
+    "XPublishOutput",
+    "XPublishTool",
+    "X_PUBLISH_TOOL_SPEC",
 ]

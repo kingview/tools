@@ -14,6 +14,8 @@ from typing import Any, Callable, Iterator
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
+from playwright.sync_api import sync_playwright
+
 from .errors import CrawlerError, ErrorCode
 
 
@@ -195,8 +197,7 @@ class SessionRegistry:
         platform = validate_session_platform(platform)
         client = self._client_factory(validate_loopback_api_url(api_url))
         detail = client.profile_detail(profile_id)
-        cookies = _platform_cookie_dicts(client.profile_cookies(profile_id), platform)
-        _require_platform_login(cookies, platform)
+        _profile_platform_cookies(client, profile_id, platform)
         now = datetime.now(UTC).isoformat()
         record = SessionRecord(
             session_ref=f"sess_{_PLATFORM_PREFIX[platform]}_{secrets.token_urlsafe(24)}",
@@ -258,8 +259,7 @@ class SessionRegistry:
                 f"该 session_ref 不是 {_PLATFORM_LABEL[platform]} 会话。",
             )
         client = self._client_factory(record.api_url)
-        cookies = _platform_cookie_dicts(client.profile_cookies(record.profile_id), platform)
-        _require_platform_login(cookies, platform)
+        _profile_platform_cookies(client, record.profile_id, platform)
         return record
 
 
@@ -281,8 +281,7 @@ class SessionRegistry:
                 f"该 session_ref 仅能用于 {_PLATFORM_LABEL[platform]} 帖子地址。",
             )
         client = self._client_factory(record.api_url)
-        cookies = _platform_cookie_dicts(client.profile_cookies(record.profile_id), platform)
-        _require_platform_login(cookies, platform)
+        cookies = _profile_platform_cookies(client, record.profile_id, platform)
         cookiefile = working_directory / f".postdrop-session-{secrets.token_hex(8)}.cookies.txt"
         try:
             _write_cookiejar(cookiefile, cookies)
@@ -310,8 +309,7 @@ class SessionRegistry:
         # and keeps browser navigation and media download on the same route.
         client.open_profile(record.profile_id)
         detail = client.profile_detail(record.profile_id)
-        cookies = _platform_cookie_dicts(_cookies_from_profile_detail(detail), platform)
-        _require_platform_login(cookies, platform)
+        cookies = _profile_platform_cookies(client, record.profile_id, platform)
         proxy_url = _proxy_url_from_profile_detail(detail)
         cookiefile = working_directory / f".postdrop-session-{secrets.token_hex(8)}.cookies.txt"
         try:
@@ -420,6 +418,48 @@ def _platform_cookie_dicts(
     return result
 
 
+def _profile_platform_cookies(
+    client: BitBrowserClient,
+    profile_id: str,
+    platform: str,
+) -> list[dict[str, Any]]:
+    """Read saved cookies, falling back to the currently open Chromium context.
+
+    BitBrowser does not always flush a running window's new cookies into
+    `/browser/detail`.  Registration and downloads must therefore consult the
+    live CDP context when the saved snapshot does not prove a login.  Cookie
+    values remain in memory and are never added to the session registry.
+    """
+    saved = _platform_cookie_dicts(client.profile_cookies(profile_id), platform)
+    try:
+        _require_platform_login(saved, platform)
+        return saved
+    except CrawlerError as saved_error:
+        try:
+            endpoint = client.open_profile(profile_id)
+            live = _platform_cookie_dicts(_read_live_profile_cookies(endpoint), platform)
+            _require_platform_login(live, platform)
+            return live
+        except CrawlerError as live_error:
+            if live_error.code is ErrorCode.SESSION_REAUTH_REQUIRED:
+                raise live_error
+            raise saved_error from live_error
+        except Exception as exc:
+            raise saved_error from exc
+
+
+def _read_live_profile_cookies(cdp_endpoint: str) -> list[dict[str, Any]]:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(cdp_endpoint, timeout=30_000)
+        if not browser.contexts:
+            raise CrawlerError(
+                ErrorCode.PLATFORM_UNAVAILABLE,
+                "比特浏览器窗口没有可用的浏览上下文。",
+                retryable=True,
+            )
+        return [dict(item) for item in browser.contexts[0].cookies()]
+
+
 def _cookies_from_profile_detail(detail: dict[str, Any]) -> list[dict[str, Any]]:
     raw = detail.get("cookie", [])
     if isinstance(raw, str):
@@ -487,7 +527,16 @@ def _proxy_url_from_profile_detail(detail: dict[str, Any]) -> str | None:
 
 
 def _require_platform_login(cookies: list[dict[str, Any]], platform: str) -> None:
-    names = {str(item.get("name")) for item in cookies}
+    now = datetime.now(UTC).timestamp()
+    names = {
+        str(item.get("name"))
+        for item in cookies
+        if str(item.get("value") or "")
+        and (
+            item.get("expirationDate", item.get("expires")) in (None, "", -1)
+            or _cookie_expiry_is_future(item, now)
+        )
+    }
     required_all = _AUTH_COOKIE_ALL.get(platform, set())
     required_any = _AUTH_COOKIE_ANY.get(platform, set())
     if not required_all.issubset(names) or (required_any and not names.intersection(required_any)):
@@ -496,6 +545,13 @@ def _require_platform_login(cookies: list[dict[str, Any]], platform: str) -> Non
             f"该 Profile 中没有检测到有效的 {_PLATFORM_LABEL[platform]} 登录会话。"
             f"请先在比特浏览器中手动登录 {_PLATFORM_LABEL[platform]}，再重新注册。",
         )
+
+
+def _cookie_expiry_is_future(item: dict[str, Any], now: float) -> bool:
+    try:
+        return float(item.get("expirationDate", item.get("expires"))) > now
+    except (TypeError, ValueError):
+        return False
 
 
 def _write_cookiejar(path: Path, cookies: list[dict[str, Any]]) -> None:

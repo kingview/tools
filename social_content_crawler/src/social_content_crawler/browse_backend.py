@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+from uuid import uuid4
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Callable, Protocol
@@ -73,6 +74,8 @@ class PlaywrightCdpAutomation:
                         timeout=request.navigation_timeout_seconds * 1_000,
                     )
                     _raise_if_login_required(page, request.platform)
+                    page.wait_for_timeout(request.settle_after_scroll_ms)
+                    _raise_if_platform_challenge(page, request.platform)
                     stagnant_rounds = 0
                     for scroll_index in range(request.max_scrolls + 1):
                         before = len(rows_by_url)
@@ -92,6 +95,7 @@ class PlaywrightCdpAutomation:
                         page.mouse.wheel(0, 1_200)
                         page.wait_for_timeout(request.settle_after_scroll_ms)
                         _raise_if_login_required(page, request.platform)
+                        _raise_if_platform_challenge(page, request.platform)
                 finally:
                     page.close()
             except CrawlerError:
@@ -212,10 +216,13 @@ def _build_douyin_source_url(request: BrowsePostsInput) -> str:
             BrowseView.USERS: "user",
         }[request.view]
         query = quote((request.query or "").strip(), safe="")
-        return f"https://www.douyin.com/search/{query}?type={search_type}"
+        # The current desktop search page only hydrates results when the request
+        # includes the client navigation id that Douyin adds after submitting the
+        # search box.  Without it the same URL renders only the navigation shell.
+        return f"https://www.douyin.com/search/{query}?aid={uuid4()}&type={search_type}"
     if request.source is BrowseSource.USER:
         return f"https://www.douyin.com/user/{quote(request.user_key or '', safe='')}"
-    return "https://www.douyin.com/"
+    return "https://www.douyin.com/jingxuan"
 
 
 def _build_xhs_source_url(request: BrowsePostsInput) -> str:
@@ -354,19 +361,28 @@ def _extract_x_rows(page: Page) -> list[dict[str, Any]]:
 
 
 def _extract_douyin_rows(page: Page) -> list[dict[str, Any]]:
-    return page.locator('a[href*="/video/"], a[href*="/note/"]').evaluate_all(
+    return page.locator(
+        'a[href*="/video/"], a[href*="/note/"], [data-aweme-id], [id^="waterfall_item_"]'
+    ).evaluate_all(
         r"""
-        (links) => links.map((link) => {
-          const href = link.getAttribute('href') || '';
+        (nodes) => nodes.map((node) => {
+          const waterfall = node.matches('[id^="waterfall_item_"]')
+            ? node
+            : node.closest('[id^="waterfall_item_"]');
+          const waterfallId = (waterfall?.id || '').replace(/^waterfall_item_/, '');
+          const awemeId = (node.getAttribute('data-aweme-id') || waterfallId || '').trim();
+          const href = node.getAttribute('href') || (awemeId ? `/video/${awemeId}` : '');
           if (!/^\/(video|note)\/\d+/.test(new URL(href, location.origin).pathname)) return null;
-          const card = link.closest('li, article, [data-e2e*="feed"], [data-e2e*="search"]') || link.parentElement;
+          const card = node.closest(
+            '[data-aweme-id], [id^="waterfall_item_"], .search-result-card, .discover-video-card-item, li, article, [data-e2e*="feed"], [data-e2e*="search"]'
+          ) || node.parentElement;
           const authorLink = card?.querySelector('a[href*="/user/"]');
           const titleNode = card?.querySelector('[data-e2e*="desc"], [class*="title"], [class*="desc"], h1, h2, h3');
           return {
             url: new URL(href, 'https://www.douyin.com').href,
             author_id: authorLink ? new URL(authorLink.getAttribute('href'), location.origin).pathname.split('/user/')[1]?.split('/')[0] : null,
             author_name: authorLink?.textContent?.trim() || null,
-            text: link.getAttribute('title') || titleNode?.textContent?.trim() || link.getAttribute('aria-label') || null,
+            text: node.getAttribute('title') || titleNode?.textContent?.trim() || node.getAttribute('aria-label') || card?.innerText?.trim() || null,
             published_at: card?.querySelector('time[datetime]')?.getAttribute('datetime') || null,
             likes: card?.querySelector('[data-e2e*="like"]')?.textContent?.trim() || null,
             has_image: Boolean(card?.querySelector('img')),
@@ -413,6 +429,17 @@ def _raise_if_login_required(page: Page, platform: BrowsePlatform) -> None:
         raise CrawlerError(
             ErrorCode.SESSION_REAUTH_REQUIRED,
             f"{_PLATFORM_LABEL[platform]} 登录会话已失效，请在对应比特浏览器 Profile 中重新登录。",
+        )
+
+
+def _raise_if_platform_challenge(page: Page, platform: BrowsePlatform) -> None:
+    title = page.title().strip().lower()
+    challenge_markers = ("验证码", "安全验证", "captcha", "verify")
+    if any(marker in title for marker in challenge_markers):
+        raise CrawlerError(
+            ErrorCode.PLATFORM_UNAVAILABLE,
+            f"{_PLATFORM_LABEL[platform]} 要求完成安全验证。请在该比特浏览器窗口中处理后再试。",
+            retryable=False,
         )
 
 

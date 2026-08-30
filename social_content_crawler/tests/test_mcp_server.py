@@ -11,4 +11,5 @@ def test_plugin_mcp_exposes_crawler_tools() -> None:
         "browse_posts",
         "browser_operate",
         "download_media",
+        "publish_x_post",
     }

@@ -29,12 +29,7 @@ python3.12 -m venv .venv
 .venv/bin/pip install -e '.[image,video,ocr,desktop,dev]'
 ```
 
-PaddleOCR 还需要按目标 CPU/GPU 和操作系统安装匹配的 PaddlePaddle。模型权重需要单独核对许可证并登记版本。
-在 macOS ARM64 的 Python 3.12 环境可以安装 CPU 版本：
-
-```bash
-.venv/bin/pip install paddlepaddle
-```
+`ocr` extra 已包含 CPU 版 PaddlePaddle。媒体插件当前以 Python 3.12 构建；Python 3.14 暂无可用的 Paddle wheel。模型权重需要单独核对许可证并登记版本。
 
 首次执行 OCR 时会下载 PaddleOCR 模型权重；之后使用本地缓存。桌面端默认从 ModelScope 下载，适合中国大陆网络；可以通过 `CONTENT_ANALYZER_OCR_MODEL_SOURCE` 覆盖来源。
 
@@ -61,7 +56,6 @@ PaddleOCR 还需要按目标 CPU/GPU 和操作系统安装匹配的 PaddlePaddle
 
 ```bash
 .venv/bin/pip install -e '.[image,video,ocr,desktop,build]'
-.venv/bin/pip install paddlepaddle
 ./scripts/build_macos.sh
 ```
 
@@ -71,7 +65,6 @@ PaddleOCR 还需要按目标 CPU/GPU 和操作系统安装匹配的 PaddlePaddle
 
 ```powershell
 .venv\Scripts\pip install -e ".[image,video,ocr,desktop,build]"
-.venv\Scripts\pip install paddlepaddle
 .\scripts\build_windows.ps1
 ```
 

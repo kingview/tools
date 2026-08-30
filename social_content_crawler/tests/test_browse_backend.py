@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 from social_content_crawler.browse_backend import (
     XPostBrowserBackend,
+    _extract_douyin_rows,
     _metric_number,
     build_source_url,
     build_x_source_url,
@@ -121,12 +123,48 @@ def test_builds_douyin_and_xiaohongshu_routes() -> None:
         view="posts",
         user_key="user123",
     )
-    assert build_source_url(douyin_search) == (
-        "https://www.douyin.com/search/%E6%9C%AC%E5%9C%B0%E5%A4%A7%E6%A8%A1%E5%9E%8B?type=video"
-    )
+    douyin_url = urlsplit(build_source_url(douyin_search))
+    douyin_query = parse_qs(douyin_url.query)
+    assert douyin_url.path == "/search/%E6%9C%AC%E5%9C%B0%E5%A4%A7%E6%A8%A1%E5%9E%8B"
+    assert douyin_query["type"] == ["video"]
+    assert len(douyin_query["aid"][0]) == 36
     assert build_source_url(xhs_user) == (
         "https://www.xiaohongshu.com/user/profile/user123"
     )
+
+
+def test_builds_douyin_recommendation_feed_route() -> None:
+    request = BrowsePostsInput(
+        platform="douyin",
+        session_ref="sess_douyin_abcdefghijklmnopqrstuvwx",
+        source="timeline",
+        view="top",
+        max_items=1,
+    )
+
+    assert build_source_url(request) == "https://www.douyin.com/jingxuan"
+
+
+def test_douyin_collector_includes_new_aweme_id_cards() -> None:
+    captured = {}
+
+    class FakeLocator:
+        def evaluate_all(self, script):
+            captured["script"] = script
+            return [{"url": "https://www.douyin.com/video/7679489315499543859"}]
+
+    class FakePage:
+        def locator(self, selector):
+            captured["selector"] = selector
+            return FakeLocator()
+
+    rows = _extract_douyin_rows(FakePage())
+
+    assert "[data-aweme-id]" in captured["selector"]
+    assert "waterfall_item_" in captured["selector"]
+    assert "data-aweme-id" in captured["script"]
+    assert "waterfall_item_" in captured["script"]
+    assert rows[0]["url"].endswith("/video/7679489315499543859")
 
 
 def test_normalizes_douyin_and_xiaohongshu_post_urls() -> None:
