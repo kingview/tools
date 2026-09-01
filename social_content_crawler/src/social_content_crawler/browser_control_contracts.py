@@ -13,6 +13,8 @@ class BrowserAction(StrEnum):
     INPUT = "input"
     PRESS = "press"
     SCROLL = "scroll"
+    SWIPE_UP = "swipe_up"
+    SWIPE_DOWN = "swipe_down"
     BACK = "back"
     FORWARD = "forward"
     RELOAD = "reload"
@@ -37,7 +39,7 @@ class BrowserOperationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_ref: str = Field(
-        pattern=r"^sess_(?:x|douyin|xhs)_[A-Za-z0-9_-]{20,80}$",
+        pattern=r"^sess_(?:x|douyin|xhs|telegram)_[A-Za-z0-9_-]{20,80}$",
         max_length=96,
     )
     action: BrowserAction
@@ -127,4 +129,3 @@ class BrowserOperationOutput(BaseModel):
     text_excerpt: str = ""
     interactive_elements: list[BrowserInteractiveElement] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
-

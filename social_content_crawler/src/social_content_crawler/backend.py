@@ -21,7 +21,9 @@ from yt_dlp.networking import Request as YtDlpRequest
 
 from .contracts import BrowserCookieSource, DownloadInput, DownloadMode, MediaFormat
 from .errors import CrawlerError, ErrorCode
-from .sessions import SessionRegistry
+from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR, ProfileTaskCoordinator
+from .sessions import SessionRegistry, TELEGRAM_PLATFORM
+from .telegram_web import TelegramWebDownloader
 
 
 _DOUYIN_AUTH_COOKIE_NAMES = {
@@ -59,38 +61,78 @@ class YtDlpBackend:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         cookie_cache_path: Path | None = None,
         session_registry: SessionRegistry | None = None,
+        task_coordinator: ProfileTaskCoordinator = GLOBAL_PROFILE_TASK_COORDINATOR,
     ) -> None:
         self._progress_callback = progress_callback
         self._cookie_cache_path = (cookie_cache_path or _default_cookie_cache_path()).expanduser()
         self._session_registry = session_registry
+        self._task_coordinator = task_coordinator
         self.last_network_route = "direct"
+        self.last_checkpoint_path: str | None = None
+        self.last_completed = True
+        self.last_stop_reason = "completed"
+        self.last_scanned_count = 0
 
     def run(self, request: DownloadInput, output_directory: Path) -> list[dict[str, Any]]:
+        self.last_checkpoint_path = None
+        self.last_completed = True
+        self.last_stop_reason = "completed"
+        self.last_scanned_count = 0
         if request.session_ref:
             if self._session_registry is None:
                 raise CrawlerError(
                     ErrorCode.CONFIGURATION_ERROR,
                     "当前 Tool Executor 没有配置 session_ref 注册表。",
                 )
-            session_context = self._session_registry.materialize_download_session(
-                request.session_ref,
-                [str(url) for url in request.urls],
-                output_directory,
-            )
+            record = self._session_registry.get(request.session_ref)
+            task_context = self._task_coordinator.hold(record.api_url, record.profile_id)
         else:
-            session_context = nullcontext(None)
-        with session_context as session:
-            self.last_network_route = (
-                "bitbrowser_profile_proxy"
-                if session is not None and session.proxy_url is not None
-                else "direct"
+            task_context = nullcontext()
+        with task_context:
+            if (
+                request.session_ref
+                and self._session_registry is not None
+                and getattr(record, "platform", "") == TELEGRAM_PLATFORM
+            ):
+                _, cdp_endpoint, has_proxy = self._session_registry.open_browser_profile(
+                    request.session_ref,
+                    [str(url) for url in request.urls],
+                )
+                self.last_network_route = (
+                    "bitbrowser_profile_proxy" if has_proxy else "direct"
+                )
+                downloader = TelegramWebDownloader(self._progress_callback)
+                result = downloader.run(
+                    cdp_endpoint=cdp_endpoint,
+                    request=request,
+                    output_directory=output_directory,
+                )
+                self.last_checkpoint_path = downloader.checkpoint_path
+                self.last_completed = downloader.completed
+                self.last_stop_reason = downloader.stop_reason
+                self.last_scanned_count = downloader.scanned_count
+                return result
+            session_context = (
+                self._session_registry.materialize_download_session(
+                    request.session_ref,
+                    [str(url) for url in request.urls],
+                    output_directory,
+                )
+                if request.session_ref and self._session_registry is not None
+                else nullcontext(None)
             )
-            return self._run(
-                request,
-                output_directory,
-                session.cookiefile if session is not None else None,
-                session.proxy_url if session is not None else None,
-            )
+            with session_context as session:
+                self.last_network_route = (
+                    "bitbrowser_profile_proxy"
+                    if session is not None and session.proxy_url is not None
+                    else "direct"
+                )
+                return self._run(
+                    request,
+                    output_directory,
+                    session.cookiefile if session is not None else None,
+                    session.proxy_url if session is not None else None,
+                )
 
     def _run(
         self,

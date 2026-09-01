@@ -51,7 +51,7 @@ def test_browse_tool_executes_and_audits() -> None:
 
     assert output.platform == "x"
     assert audit.events[0].tool_name == "social.browse_posts"
-    assert audit.events[0].tool_version == "1.0.0"
+    assert audit.events[0].tool_version == "1.1.0"
     assert audit.events[0].event_type == "tool.succeeded"
     assert BROWSE_TOOL_SPEC.required_permissions == [
         "social_content.read",

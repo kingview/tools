@@ -13,9 +13,9 @@ from .ports import AuditSink, RateLimiter, ToolContext
 
 BROWSE_TOOL_SPEC = ToolSpec(
     name="social.browse_posts",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Browse an authorized Douyin, Xiaohongshu, or X session and return "
+        "Browse an authorized Douyin, Xiaohongshu, X, or Telegram Web session and return "
         "structured post URLs and metadata."
     ),
     input_schema=BrowsePostsInput.model_json_schema(),

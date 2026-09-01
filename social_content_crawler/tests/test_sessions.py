@@ -61,6 +61,9 @@ def _transport(path: str, payload: dict):
                 "cookie": json.dumps(AUTH_COOKIES),
             },
         }
+    if path == "/browser/pids/alive":
+        assert payload == {"ids": [PROFILE_ID]}
+        return {"success": True, "data": {}}
     if path == "/browser/open":
         assert payload == {"id": PROFILE_ID, "loadExtensions": False}
         return {
@@ -85,6 +88,25 @@ def test_bitbrowser_client_lists_profiles() -> None:
     client.health()
     assert client.list_profiles()[0].profile_id == PROFILE_ID
     assert client.open_profile(PROFILE_ID).startswith("ws://127.0.0.1:50106/")
+
+
+def test_bitbrowser_client_reuses_running_profile_without_opening_again() -> None:
+    calls: list[str] = []
+
+    def transport(path: str, payload: dict):
+        calls.append(path)
+        if path == "/browser/pids/alive":
+            assert payload == {"ids": [PROFILE_ID]}
+            return {"success": True, "data": {PROFILE_ID: 43210}}
+        if path == "/browser/ports":
+            assert payload == {}
+            return {"success": True, "data": {PROFILE_ID: "50106"}}
+        raise AssertionError(f"window should not be reopened: {path}")
+
+    client = BitBrowserClient("http://127.0.0.1:54345", transport=transport)
+
+    assert client.open_profile(PROFILE_ID) == "http://127.0.0.1:50106"
+    assert calls == ["/browser/pids/alive", "/browser/ports"]
 
 
 @pytest.mark.parametrize(
@@ -304,3 +326,20 @@ def test_registration_uses_live_cookies_when_open_profile_snapshot_is_stale(
     assert record.session_ref.startswith("sess_xhs_")
     assert registry.validate_session(record.session_ref, "xiaohongshu") == record
     assert "live-only-secret" not in registry.path.read_text(encoding="utf-8")
+
+
+def test_registers_telegram_from_live_web_session_without_exporting_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sessions_module, "_require_telegram_web_login", lambda endpoint: None)
+    registry = _registry(tmp_path)
+
+    record = registry.register_bitbrowser(
+        "telegram", "http://127.0.0.1:54345", PROFILE_ID
+    )
+
+    assert record.session_ref.startswith("sess_telegram_")
+    assert registry.validate_session(record.session_ref, "telegram") == record
+    stored = registry.path.read_text(encoding="utf-8")
+    assert "secret-auth-token" not in stored

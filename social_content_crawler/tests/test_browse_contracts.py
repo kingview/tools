@@ -83,3 +83,22 @@ def test_session_reference_must_match_platform() -> None:
             source="timeline",
             view="top",
         )
+
+
+def test_telegram_contract_accepts_channel_and_rejects_search() -> None:
+    request = BrowsePostsInput(
+        platform="telegram",
+        session_ref="sess_telegram_abcdefghijklmnopqrstuvwx",
+        source="url",
+        view="posts",
+        start_url="https://t.me/weme_download",
+    )
+    assert request.platform == "telegram"
+    with pytest.raises(ValidationError):
+        BrowsePostsInput(
+            platform="telegram",
+            session_ref="sess_telegram_abcdefghijklmnopqrstuvwx",
+            source="search",
+            view="top",
+            query="web3",
+        )

@@ -23,23 +23,27 @@ BITBROWSER_PROVIDER = "bitbrowser"
 X_PLATFORM = "x"
 DOUYIN_PLATFORM = "douyin"
 XIAOHONGSHU_PLATFORM = "xiaohongshu"
+TELEGRAM_PLATFORM = "telegram"
 SUPPORTED_SESSION_PLATFORMS = frozenset(
-    {X_PLATFORM, DOUYIN_PLATFORM, XIAOHONGSHU_PLATFORM}
+    {X_PLATFORM, DOUYIN_PLATFORM, XIAOHONGSHU_PLATFORM, TELEGRAM_PLATFORM}
 )
 _PLATFORM_PREFIX = {
     X_PLATFORM: "x",
     DOUYIN_PLATFORM: "douyin",
     XIAOHONGSHU_PLATFORM: "xhs",
+    TELEGRAM_PLATFORM: "telegram",
 }
 _PLATFORM_LABEL = {
     X_PLATFORM: "X / Twitter",
     DOUYIN_PLATFORM: "抖音",
     XIAOHONGSHU_PLATFORM: "小红书",
+    TELEGRAM_PLATFORM: "Telegram Web",
 }
 _PLATFORM_DOMAINS = {
     X_PLATFORM: {"x.com", "twitter.com"},
     DOUYIN_PLATFORM: {"douyin.com", "iesdouyin.com"},
     XIAOHONGSHU_PLATFORM: {"xiaohongshu.com", "xhslink.com"},
+    TELEGRAM_PLATFORM: {"t.me", "telegram.me", "web.telegram.org"},
 }
 _AUTH_COOKIE_ALL = {X_PLATFORM: {"auth_token", "ct0"}}
 _AUTH_COOKIE_ANY = {
@@ -132,10 +136,19 @@ class BitBrowserClient:
     def open_profile(self, profile_id: str) -> str:
         if not profile_id.strip():
             raise CrawlerError(ErrorCode.INVALID_REQUEST, "请选择一个比特浏览器 Profile。")
+        profile_id = profile_id.strip()
+
+        # Reuse an already running BitBrowser window. The official ports endpoint
+        # exposes the CDP port of open profiles, so a new /browser/open call is
+        # unnecessary in the common case.
+        existing_endpoint = self._running_profile_endpoint(profile_id)
+        if existing_endpoint:
+            return existing_endpoint
+
         data = self._post(
             "/browser/open",
             {
-                "id": profile_id.strip(),
+                "id": profile_id,
                 "loadExtensions": False,
             },
         )
@@ -147,6 +160,32 @@ class BitBrowserClient:
             if http_endpoint:
                 endpoint = http_endpoint if "://" in http_endpoint else f"http://{http_endpoint}"
         return validate_loopback_cdp_endpoint(endpoint)
+
+    def _running_profile_endpoint(self, profile_id: str) -> str | None:
+        """Return an active profile's local CDP endpoint without reopening it."""
+        try:
+            alive = self._post("/browser/pids/alive", {"ids": [profile_id]})
+            if not isinstance(alive, dict) or not alive.get(profile_id):
+                return None
+            ports = self._post("/browser/ports", {})
+        except CrawlerError:
+            # Older BitBrowser clients may not expose the newer liveness API.
+            # Falling back to /browser/open preserves compatibility; that API is
+            # also responsible for returning a usable CDP endpoint.
+            return None
+
+        if not isinstance(ports, dict):
+            return None
+        raw_port: Any = ports.get(profile_id)
+        if isinstance(raw_port, dict):
+            raw_port = raw_port.get("port") or raw_port.get("remoteDebuggingPort")
+        try:
+            port = int(str(raw_port).strip())
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= port <= 65_535:
+            return None
+        return validate_loopback_cdp_endpoint(f"http://127.0.0.1:{port}")
 
     def _post(self, path: str, payload: dict[str, Any]) -> Any:
         if self._transport is not None:
@@ -197,7 +236,7 @@ class SessionRegistry:
         platform = validate_session_platform(platform)
         client = self._client_factory(validate_loopback_api_url(api_url))
         detail = client.profile_detail(profile_id)
-        _profile_platform_cookies(client, profile_id, platform)
+        _validate_profile_login(client, profile_id, platform)
         now = datetime.now(UTC).isoformat()
         record = SessionRecord(
             session_ref=f"sess_{_PLATFORM_PREFIX[platform]}_{secrets.token_urlsafe(24)}",
@@ -259,8 +298,33 @@ class SessionRegistry:
                 f"该 session_ref 不是 {_PLATFORM_LABEL[platform]} 会话。",
             )
         client = self._client_factory(record.api_url)
-        _profile_platform_cookies(client, record.profile_id, platform)
+        _validate_profile_login(client, record.profile_id, platform)
         return record
+
+    def open_browser_profile(
+        self,
+        session_ref: str,
+        source_urls: list[str],
+    ) -> tuple[SessionRecord, str, bool]:
+        """Open a registered Profile without exporting browser credentials.
+
+        This is used by browser-native extractors such as Telegram Web whose
+        authenticated state lives in the Chromium profile rather than a cookie
+        file.  The returned boolean only describes whether the Profile has a
+        configured proxy; proxy credentials never leave this process.
+        """
+        record = self.get(session_ref)
+        platform = validate_session_platform(record.platform)
+        if not source_urls or not all(_is_platform_url(url, platform) for url in source_urls):
+            raise CrawlerError(
+                ErrorCode.INVALID_REQUEST,
+                f"该 session_ref 仅能用于 {_PLATFORM_LABEL[platform]} 帖子地址。",
+            )
+        client = self._client_factory(record.api_url)
+        endpoint = client.open_profile(record.profile_id)
+        _validate_profile_login(client, record.profile_id, platform, cdp_endpoint=endpoint)
+        detail = client.profile_detail(record.profile_id)
+        return record, endpoint, _proxy_url_from_profile_detail(detail) is not None
 
 
     def validate_x_session(self, session_ref: str) -> SessionRecord:
@@ -372,7 +436,7 @@ def validate_session_platform(value: str) -> str:
     if platform not in SUPPORTED_SESSION_PLATFORMS:
         raise CrawlerError(
             ErrorCode.INVALID_REQUEST,
-            "登录会话平台仅支持 x、douyin、xiaohongshu。",
+            "登录会话平台仅支持 x、douyin、xiaohongshu、telegram。",
         )
     return platform
 
@@ -446,6 +510,60 @@ def _profile_platform_cookies(
             raise saved_error from live_error
         except Exception as exc:
             raise saved_error from exc
+
+
+def _validate_profile_login(
+    client: BitBrowserClient,
+    profile_id: str,
+    platform: str,
+    *,
+    cdp_endpoint: str | None = None,
+) -> None:
+    if platform == TELEGRAM_PLATFORM:
+        endpoint = cdp_endpoint or client.open_profile(profile_id)
+        _require_telegram_web_login(endpoint)
+        return
+    _profile_platform_cookies(client, profile_id, platform)
+
+
+def _require_telegram_web_login(cdp_endpoint: str) -> None:
+    """Validate Telegram Web through its live UI, never through exported auth."""
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(cdp_endpoint, timeout=30_000)
+        if not browser.contexts:
+            raise CrawlerError(
+                ErrorCode.PLATFORM_UNAVAILABLE,
+                "比特浏览器窗口没有可用的浏览上下文。",
+                retryable=True,
+            )
+        pages = [
+            page
+            for page in browser.contexts[0].pages
+            if not page.is_closed()
+            and (urlsplit(page.url).hostname or "").lower() == "web.telegram.org"
+        ]
+        if not pages:
+            raise CrawlerError(
+                ErrorCode.SESSION_REAUTH_REQUIRED,
+                "该 Profile 中没有打开已登录的 Telegram Web。"
+                "请先在比特浏览器中打开 web.telegram.org 并登录，再重新注册。",
+            )
+        page = pages[-1]
+        page.wait_for_timeout(500)
+        logged_in_selectors = (
+            ".MessageList, .chat-list, #LeftColumn, "
+            "[class*='ChatList'], [class*='MessageList']"
+        )
+        try:
+            logged_in = page.locator(logged_in_selectors).first.is_visible(timeout=2_000)
+        except Exception:
+            logged_in = False
+        if not logged_in:
+            raise CrawlerError(
+                ErrorCode.SESSION_REAUTH_REQUIRED,
+                "该 Profile 中没有检测到有效的 Telegram Web 登录会话。"
+                "请先在比特浏览器中手动登录 Telegram Web，再重新注册。",
+            )
 
 
 def _read_live_profile_cookies(cdp_endpoint: str) -> list[dict[str, Any]]:

@@ -47,6 +47,7 @@ DEFAULT_ALLOWED_DOMAINS = default_allowed_domains()
 SESSION_PLATFORM_LABELS = {
     "douyin": "抖音",
     "xiaohongshu": "小红书",
+    "telegram": "Telegram Web",
     "x": "X / Twitter",
 }
 
@@ -108,6 +109,12 @@ class DownloadWorker(QThread):
 
     def _on_progress(self, event: dict[str, Any]) -> None:
         status = event.get("status")
+        if status == "channel_scanning":
+            completed = int(event.get("downloaded_messages") or 0)
+            maximum = max(1, int(event.get("max_messages") or 1))
+            percent = max(3, min(92, int(completed / maximum * 90)))
+            self.progress_changed.emit(percent, f"正在遍历 Telegram 历史消息 · 已整理 {completed} 条")
+            return
         if status == "finished":
             self.progress_changed.emit(96, "媒体已保存，正在整理文件…")
             return
@@ -145,9 +152,9 @@ class SessionManagerDialog(QDialog):
         title = QLabel("注册已手动登录的比特浏览器 Profile")
         title.setObjectName("dialogTitle")
         copy = QLabel(
-            "PostDrop 会生成 session_ref。下载时临时读取该 Profile 对应平台的 Cookie，"
-            "并让媒体流量使用该窗口配置的代理（noproxy 时直连）；Cookie 用完即删除。不会读取密码，"
-            "也不会修改代理或指纹。"
+            "PostDrop 会生成 session_ref。抖音、小红书和 X 下载时仅在内存中使用对应平台登录态；"
+            "Telegram 直接复用已登录的 Web 页面。媒体流量使用该窗口配置的代理（noproxy 时直连）。"
+            "不会读取密码，也不会修改代理或指纹。"
         )
         copy.setObjectName("dialogCopy")
         copy.setWordWrap(True)
@@ -390,7 +397,7 @@ class MainWindow(QMainWindow):
         card_header.addWidget(safe_note)
         card_layout.addLayout(card_header)
 
-        input_label = QLabel("社媒帖子地址")
+        input_label = QLabel("社媒帖子或 Telegram 频道地址")
         input_label.setObjectName("fieldLabel")
         card_layout.addWidget(input_label)
 
@@ -409,7 +416,7 @@ class MainWindow(QMainWindow):
         input_row.addWidget(self.download_button)
         card_layout.addLayout(input_row)
 
-        help_text = QLabel("支持公开 HTTPS 帖子；抖音、小红书和 X 可选择已注册登录会话。也可以把链接拖进窗口")
+        help_text = QLabel("支持公开 HTTPS 帖子；粘贴 Telegram 频道地址时会通过已登录会话遍历并断点保存。也可以把链接拖进窗口")
         help_text.setObjectName("helpText")
         card_layout.addWidget(help_text)
 
@@ -581,6 +588,10 @@ class MainWindow(QMainWindow):
                     else BrowserCookieSource.NONE
                 ),
                 session_ref=self.session_combo.currentData(),
+                telegram_scope=(
+                    "channel" if is_telegram_channel_url(raw_url) else "messages"
+                ),
+                telegram_max_messages=2_000,
             )
         except ValidationError as exc:
             self._show_error(str(exc.errors()[0].get("msg", "帖子地址不正确")))
@@ -798,6 +809,9 @@ def extract_post_url(value: str) -> str:
         "xhslink.com",
         "xhslink.cn",
         "xiaohongshu.com",
+        "t.me",
+        "telegram.me",
+        "web.telegram.org",
     }
     if parsed.scheme.lower() == "http" and any(
         host == domain or host.endswith(f".{domain}") for domain in https_upgrade_domains
@@ -805,6 +819,19 @@ def extract_post_url(value: str) -> str:
         parsed = parsed._replace(scheme="https")
         candidate = urlunsplit(parsed)
     return candidate
+
+
+def is_telegram_channel_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host == "web.telegram.org":
+        return bool(parsed.fragment)
+    if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+        return False
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 3 and parts[0] == "c" and parts[1].isdigit() and parts[2].isdigit():
+        return False
+    return len(parts) == 1 or (len(parts) == 2 and parts[0] == "c" and parts[1].isdigit())
 
 
 def format_bytes(value: float) -> str:

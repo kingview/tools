@@ -3,7 +3,6 @@ from __future__ import annotations
 import ipaddress
 import re
 import threading
-from collections import defaultdict
 from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
 
@@ -16,6 +15,7 @@ from .browser_control_contracts import (
     BrowserOperationOutput,
 )
 from .errors import CrawlerError, ErrorCode
+from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR, ProfileTaskCoordinator
 from .sessions import BitBrowserClient, SessionRegistry
 
 
@@ -65,6 +65,8 @@ class PlaywrightBrowserControlAutomation:
                 if not browser.contexts:
                     raise CrawlerError(ErrorCode.BROWSE_FAILED, "比特浏览器没有可用的浏览上下文。")
                 context = browser.contexts[0]
+                if not self._has_remembered_page(request.session_ref):
+                    _wait_for_restored_tabs(context.pages)
                 page = self._resolve_page(context.pages, request.session_ref)
                 if page is None:
                     page = context.new_page()
@@ -149,6 +151,12 @@ class PlaywrightBrowserControlAutomation:
         if action is BrowserAction.SCROLL:
             page.mouse.wheel(0, request.scroll_y)
             return
+        if action is BrowserAction.SWIPE_UP:
+            page.mouse.wheel(0, abs(request.scroll_y))
+            return
+        if action is BrowserAction.SWIPE_DOWN:
+            page.mouse.wheel(0, -abs(request.scroll_y))
+            return
         if action is BrowserAction.BACK:
             page.go_back(wait_until="domcontentloaded", timeout=request.timeout_seconds * 1_000)
             return
@@ -187,7 +195,16 @@ class PlaywrightBrowserControlAutomation:
                 if _target_id(page) == expected:
                     return page
         visible_pages = [page for page in pages if not page.is_closed() and page.url != "about:blank"]
+        platform_pages = [
+            page for page in visible_pages if _page_matches_session_platform(page, session_ref)
+        ]
+        if platform_pages:
+            return platform_pages[-1]
         return visible_pages[-1] if visible_pages else None
+
+    def _has_remembered_page(self, session_ref: str) -> bool:
+        with self._state_lock:
+            return bool(self._target_ids.get(session_ref))
 
     def _remember_page(self, page: Page, session_ref: str) -> None:
         target_id = _target_id(page)
@@ -203,27 +220,19 @@ class BitBrowserControlBackend:
         session_registry: SessionRegistry,
         automation: BrowserControlAutomation | None = None,
         client_factory: Callable[[str], BitBrowserClient] = BitBrowserClient,
+        task_coordinator: ProfileTaskCoordinator = GLOBAL_PROFILE_TASK_COORDINATOR,
     ) -> None:
         self._session_registry = session_registry
         self._automation = automation or PlaywrightBrowserControlAutomation()
         self._client_factory = client_factory
-        self._locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._task_coordinator = task_coordinator
 
     def run(self, request: BrowserOperationInput) -> BrowserOperationOutput:
-        lock = self._locks[request.session_ref]
-        if not lock.acquire(timeout=5.0):
-            raise CrawlerError(
-                ErrorCode.SESSION_BUSY,
-                "该 session_ref 正在执行另一个浏览器操作，请稍后重试。",
-                retryable=True,
-            )
-        try:
-            record = self._session_registry.get(request.session_ref)
+        record = self._session_registry.get(request.session_ref)
+        with self._task_coordinator.hold(record.api_url, record.profile_id):
             client = self._client_factory(record.api_url)
             cdp_endpoint = client.open_profile(record.profile_id)
             return self._automation.perform(cdp_endpoint=cdp_endpoint, request=request)
-        finally:
-            lock.release()
 
 
 def _require_public_https_url(value: str) -> None:
@@ -269,6 +278,31 @@ def _target_id(page: Page) -> str | None:
             session.detach()
     except Exception:
         return None
+
+
+def _wait_for_restored_tabs(pages: list[Page]) -> None:
+    active = [page for page in pages if not page.is_closed()]
+    if active:
+        active[-1].wait_for_timeout(500)
+    else:
+        from time import sleep
+
+        sleep(0.5)
+
+
+def _page_matches_session_platform(page: Page, session_ref: str) -> bool:
+    host = (urlsplit(page.url).hostname or "").lower().rstrip(".")
+    if session_ref.startswith("sess_douyin_"):
+        domains = ("douyin.com",)
+    elif session_ref.startswith("sess_xhs_"):
+        domains = ("xiaohongshu.com",)
+    elif session_ref.startswith("sess_x_"):
+        domains = ("x.com", "twitter.com")
+    elif session_ref.startswith("sess_telegram_"):
+        domains = ("web.telegram.org", "t.me", "telegram.me")
+    else:
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
 
 
 def _page_text(page: Page, max_chars: int) -> str:

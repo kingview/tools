@@ -17,6 +17,7 @@ from .browser_control_tool import BitBrowserControlTool
 from .contracts import DownloadInput
 from .platforms import default_allowed_domains
 from .ports import ToolContext
+from .profile_tasks import ProfileTaskCoordinator
 from .runtime import InMemoryAuditSink, LocalRateLimiter
 from .sessions import SessionRegistry
 from .tool import SocialMediaDownloadTool
@@ -42,18 +43,28 @@ class Runtime:
         self.output_root = _required_path("SOCIAL_AGENT_OUTPUT_ROOT")
         audit = InMemoryAuditSink()
         limiter = LocalRateLimiter()
+        task_coordinator = ProfileTaskCoordinator()
         self.browse = SocialPostBrowseTool(
-            backend=SocialPostBrowserBackend(session_registry=registry),
+            backend=SocialPostBrowserBackend(
+                session_registry=registry,
+                task_coordinator=task_coordinator,
+            ),
             audit_sink=audit,
             rate_limiter=limiter,
         )
         self.browser = BitBrowserControlTool(
-            backend=BitBrowserControlBackend(session_registry=registry),
+            backend=BitBrowserControlBackend(
+                session_registry=registry,
+                task_coordinator=task_coordinator,
+            ),
             audit_sink=audit,
             rate_limiter=limiter,
         )
         self.download = SocialMediaDownloadTool(
-            backend=YtDlpBackend(session_registry=registry),
+            backend=YtDlpBackend(
+                session_registry=registry,
+                task_coordinator=task_coordinator,
+            ),
             audit_sink=audit,
             rate_limiter=limiter,
             url_policy=PublicHttpsUrlPolicy(),
@@ -65,6 +76,7 @@ class Runtime:
                 session_registry=registry,
                 output_root=self.output_root,
                 expected_approval_token=os.getenv("SOCIAL_AGENT_X_PUBLISH_APPROVAL_TOKEN", ""),
+                task_coordinator=task_coordinator,
             ),
             audit_sink=audit,
             rate_limiter=limiter,
@@ -138,6 +150,8 @@ async def download_media(
     session_ref: str,
     media_format: str = "best",
     max_total_size_mb: int = 1000,
+    telegram_scope: str = "messages",
+    telegram_max_messages: int = 2000,
 ) -> dict[str, Any]:
     request = DownloadInput(
         urls=urls,
@@ -145,6 +159,8 @@ async def download_media(
         media_format=media_format,
         max_items=min(len(urls), 20),
         max_total_size_mb=max_total_size_mb,
+        telegram_scope=telegram_scope,
+        telegram_max_messages=telegram_max_messages,
     )
     result = await runtime().download.execute(request, runtime().context())
     return result.model_dump(mode="json")

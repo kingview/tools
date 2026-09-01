@@ -15,6 +15,7 @@ from playwright.sync_api import (
 )
 
 from .errors import CrawlerError, ErrorCode
+from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR, ProfileTaskCoordinator
 from .sessions import BitBrowserClient, SessionRegistry
 from .x_publish_contracts import XPublishInput, XPublishOutput
 
@@ -120,12 +121,14 @@ class XPublishBackend:
         expected_approval_token: str,
         automation: XPublishAutomation | None = None,
         client_factory: Callable[[str], BitBrowserClient] = BitBrowserClient,
+        task_coordinator: ProfileTaskCoordinator = GLOBAL_PROFILE_TASK_COORDINATOR,
     ) -> None:
         self._session_registry = session_registry
         self._output_root = output_root.expanduser().resolve()
         self._expected_approval_token = expected_approval_token
         self._automation = automation or PlaywrightXPublishAutomation()
         self._client_factory = client_factory
+        self._task_coordinator = task_coordinator
         self._lock = threading.Lock()
         self._consumed = False
 
@@ -148,15 +151,16 @@ class XPublishBackend:
                 )
             record = self._session_registry.validate_x_session(request.session_ref)
             media_paths = _validated_media_paths(request.media_paths, self._output_root)
-            # Consume immediately before opening/operating the browser. An ambiguous
-            # network result must never be retried with the same approval.
-            self._consumed = True
-            cdp_endpoint = self._client_factory(record.api_url).open_profile(record.profile_id)
-            return self._automation.publish(
-                cdp_endpoint=cdp_endpoint,
-                request=request,
-                media_paths=media_paths,
-            )
+            with self._task_coordinator.hold(record.api_url, record.profile_id):
+                # Consume immediately before opening/operating the browser. An ambiguous
+                # network result must never be retried with the same approval.
+                self._consumed = True
+                cdp_endpoint = self._client_factory(record.api_url).open_profile(record.profile_id)
+                return self._automation.publish(
+                    cdp_endpoint=cdp_endpoint,
+                    request=request,
+                    media_paths=media_paths,
+                )
         finally:
             self._lock.release()
 

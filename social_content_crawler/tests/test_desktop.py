@@ -15,6 +15,7 @@ from social_content_crawler.desktop import (
     extract_post_url,
     format_bytes,
     format_duration,
+    is_telegram_channel_url,
 )
 from social_content_crawler.platforms import PLATFORM_CATALOG, supported_platform_label
 
@@ -53,7 +54,7 @@ def test_session_manager_lists_mainland_platforms_first(tmp_path: Path) -> None:
     assert [
         dialog.platform_combo.itemData(index)
         for index in range(dialog.platform_combo.count())
-    ] == ["douyin", "xiaohongshu", "x"]
+    ] == ["douyin", "xiaohongshu", "telegram", "x"]
     assert dialog.platform_combo.itemText(0) == SESSION_PLATFORM_LABELS["douyin"]
     assert dialog.platform_combo.itemText(1) == SESSION_PLATFORM_LABELS["xiaohongshu"]
     dialog.close()
@@ -70,10 +71,11 @@ def test_mainland_china_platforms_are_enabled() -> None:
     assert "xiaohongshu.com" in DEFAULT_ALLOWED_DOMAINS
     assert "xhslink.com" in DEFAULT_ALLOWED_DOMAINS
     assert "xhslink.cn" in DEFAULT_ALLOWED_DOMAINS
+    assert "t.me" in DEFAULT_ALLOWED_DOMAINS
 
 
 def test_platform_catalog_drives_domain_allowlist_and_ui() -> None:
-    assert len(PLATFORM_CATALOG) == 13
+    assert len(PLATFORM_CATALOG) == 14
     assert DEFAULT_ALLOWED_DOMAINS == frozenset(
         domain for platform in PLATFORM_CATALOG for domain in platform.domains
     )
@@ -92,3 +94,10 @@ def test_extracts_urls_from_chinese_share_text() -> None:
     assert extract_post_url("打开小红书查看 http://xhslink.cn/o/ABC123") == (
         "https://xhslink.cn/o/ABC123"
     )
+
+
+def test_detects_telegram_channel_but_not_message_url() -> None:
+    assert is_telegram_channel_url("https://t.me/weme_download")
+    assert is_telegram_channel_url("https://t.me/c/1634371164")
+    assert not is_telegram_channel_url("https://t.me/weme_download/123")
+    assert not is_telegram_channel_url("https://t.me/c/1634371164/456")

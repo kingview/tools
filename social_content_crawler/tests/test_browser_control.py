@@ -50,6 +50,16 @@ def test_contract_supports_observe_click_input_scroll_and_paging() -> None:
         action="scroll",
         scroll_y=1200,
     ).scroll_y == 1200
+    assert BrowserOperationInput(
+        session_ref=SESSION_REF,
+        action="swipe_up",
+        scroll_y=900,
+    ).action == "swipe_up"
+    assert BrowserOperationInput(
+        session_ref=SESSION_REF,
+        action="swipe_down",
+        scroll_y=900,
+    ).action == "swipe_down"
 
 
 def test_contract_rejects_ambiguous_targets_and_credentials_in_url() -> None:
@@ -153,4 +163,3 @@ def test_browser_control_tool_executes_and_audits() -> None:
     assert output.title == "web3 - 抖音搜索"
     assert audit.events[0].tool_name == "browser.operate"
     assert BROWSER_CONTROL_TOOL_SPEC.requires_approval is True
-

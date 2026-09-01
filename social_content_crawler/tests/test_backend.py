@@ -90,6 +90,12 @@ def test_backend_uses_registered_session_cookiefile_and_profile_proxy(
             cookiefile.unlink(missing_ok=True)
 
     class FakeRegistry:
+        def get(self, session_ref):
+            return SimpleNamespace(
+                api_url="http://127.0.0.1:54345",
+                profile_id="profile-x-1",
+            )
+
         def materialize_download_session(self, session_ref, source_urls, working_directory):
             assert session_ref.startswith("sess_x_")
             assert source_urls == ["https://x.com/author/status/1"]
@@ -144,6 +150,12 @@ def test_registered_session_without_proxy_downloads_directly(monkeypatch, tmp_pa
             cookiefile.unlink(missing_ok=True)
 
     class FakeRegistry:
+        def get(self, session_ref):
+            return SimpleNamespace(
+                api_url="http://127.0.0.1:54345",
+                profile_id="profile-x-1",
+            )
+
         def materialize_download_session(self, *args):
             return Materialized()
 

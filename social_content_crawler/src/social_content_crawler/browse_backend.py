@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import re
-import threading
+from time import monotonic, sleep
 from uuid import uuid4
-from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Callable, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
@@ -20,18 +19,51 @@ from .browse_contracts import (
     PostMetrics,
 )
 from .errors import CrawlerError, ErrorCode
+from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR, ProfileTaskCoordinator
 from .sessions import BitBrowserClient, SessionRegistry
+from .telegram_web import resolve_telegram_web_url
 
 
 _X_POST_PATH = re.compile(r"^/([A-Za-z0-9_]{1,15})/status/(\d+)")
 _DOUYIN_POST_PATH = re.compile(r"^/(?:video|note)/(\d+)")
 _XHS_POST_PATH = re.compile(r"^/(?:explore|discovery/item)/([A-Za-z0-9]+)")
+_TELEGRAM_PUBLIC_POST_PATH = re.compile(r"^/([A-Za-z0-9_]{4,})/(\d+)")
+_TELEGRAM_PRIVATE_POST_PATH = re.compile(r"^/c/(\d+)/(\d+)")
 _NUMBER = re.compile(r"([0-9]+(?:[.,][0-9]+)?)\s*([KMB万亿]?)", re.IGNORECASE)
 _PLATFORM_LABEL = {
     BrowsePlatform.X: "X / Twitter",
     BrowsePlatform.DOUYIN: "抖音",
     BrowsePlatform.XIAOHONGSHU: "小红书",
+    BrowsePlatform.TELEGRAM: "Telegram Web",
 }
+_POST_SELECTORS = {
+    BrowsePlatform.X: 'article[data-testid="tweet"]',
+    BrowsePlatform.DOUYIN: (
+        'a[href*="/video/"], a[href*="/note/"], '
+        '[data-aweme-id], [id^="waterfall_item_"]'
+    ),
+    BrowsePlatform.XIAOHONGSHU: (
+        'a[href*="/explore/"], a[href*="/discovery/item/"]'
+    ),
+    BrowsePlatform.TELEGRAM: ".Message.message-list-item[data-message-id]",
+}
+_CHALLENGE_SELECTORS = (
+    'iframe[src*="captcha" i], iframe[src*="verify" i], '
+    '[id*="captcha" i], [class*="captcha" i], '
+    '[data-e2e*="captcha" i], [data-testid*="captcha" i], '
+    '.secsdk-captcha-drag-icon, .captcha_verify_container'
+)
+_CHALLENGE_TEXT_MARKERS = (
+    "请完成下列验证",
+    "请完成安全验证",
+    "请完成图片验证",
+    "点击图中",
+    "请选择所有",
+    "拖动滑块",
+    "验证后继续",
+    "图片验证",
+    "安全验证",
+)
 
 
 class BrowserAutomation(Protocol):
@@ -65,21 +97,45 @@ class PlaywrightCdpAutomation:
                 )
                 if not browser.contexts:
                     raise CrawlerError(ErrorCode.BROWSE_FAILED, "比特浏览器没有可用的浏览上下文。")
-                page = browser.contexts[0].new_page()
+                context = browser.contexts[0]
+                _wait_for_restored_tabs(context)
+                page = _existing_platform_page(context.pages, request.platform)
+                created_page = page is None
+                if page is None:
+                    page = context.new_page()
                 page.set_default_timeout(request.navigation_timeout_seconds * 1_000)
                 try:
-                    page.goto(
-                        source_url,
-                        wait_until="domcontentloaded",
-                        timeout=request.navigation_timeout_seconds * 1_000,
-                    )
+                    if request.platform is BrowsePlatform.TELEGRAM:
+                        source_url = resolve_telegram_web_url(page, source_url)
+                    if not _same_navigation_url(page.url, source_url):
+                        page.goto(
+                            source_url,
+                            wait_until="domcontentloaded",
+                            timeout=request.navigation_timeout_seconds * 1_000,
+                        )
                     _raise_if_login_required(page, request.platform)
                     page.wait_for_timeout(request.settle_after_scroll_ms)
-                    _raise_if_platform_challenge(page, request.platform)
+                    challenge_wait_ms = int(
+                        max(
+                            60_000,
+                            min(request.navigation_timeout_seconds * 1_000, 120_000),
+                        )
+                    )
+                    _raise_if_platform_challenge(
+                        page,
+                        request.platform,
+                        wait_timeout_ms=challenge_wait_ms,
+                    )
+                    _wait_for_initial_posts(page, request)
+                    _raise_if_platform_challenge(
+                        page,
+                        request.platform,
+                        wait_timeout_ms=challenge_wait_ms,
+                    )
                     stagnant_rounds = 0
                     for scroll_index in range(request.max_scrolls + 1):
                         before = len(rows_by_url)
-                        for row in _extract_rows(page, request.platform):
+                        for row in _extract_rows(page, request):
                             url = str(row.get("url") or "")
                             if url:
                                 rows_by_url.setdefault(url, row)
@@ -92,12 +148,22 @@ class PlaywrightCdpAutomation:
                         stagnant_rounds = stagnant_rounds + 1 if len(rows_by_url) == before else 0
                         if stagnant_rounds >= 3:
                             break
-                        page.mouse.wheel(0, 1_200)
+                        if request.platform is BrowsePlatform.TELEGRAM:
+                            page.locator(".MessageList").first.evaluate(
+                                "node => node.scrollBy(0, -1200)"
+                            )
+                        else:
+                            page.mouse.wheel(0, 1_200)
                         page.wait_for_timeout(request.settle_after_scroll_ms)
                         _raise_if_login_required(page, request.platform)
-                        _raise_if_platform_challenge(page, request.platform)
+                        _raise_if_platform_challenge(
+                            page,
+                            request.platform,
+                            wait_timeout_ms=challenge_wait_ms,
+                        )
                 finally:
-                    page.close()
+                    if created_page and not page.is_closed():
+                        page.close()
             except CrawlerError:
                 raise
             except PlaywrightTimeoutError as exc:
@@ -126,25 +192,19 @@ class SocialPostBrowserBackend:
         session_registry: SessionRegistry,
         automation: BrowserAutomation | None = None,
         client_factory: Callable[[str], BitBrowserClient] = BitBrowserClient,
+        task_coordinator: ProfileTaskCoordinator = GLOBAL_PROFILE_TASK_COORDINATOR,
     ) -> None:
         self._session_registry = session_registry
         self._automation = automation or PlaywrightCdpAutomation()
         self._client_factory = client_factory
-        self._locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._task_coordinator = task_coordinator
 
     def run(self, request: BrowsePostsInput) -> BrowsePostsOutput:
-        lock = self._locks[request.session_ref]
-        if not lock.acquire(timeout=5.0):
-            raise CrawlerError(
-                ErrorCode.SESSION_BUSY,
-                "该 session_ref 正在执行另一个浏览任务，请稍后重试。",
-                retryable=True,
-            )
-        try:
-            record = self._session_registry.validate_session(
-                request.session_ref,
-                request.platform.value,
-            )
+        record = self._session_registry.validate_session(
+            request.session_ref,
+            request.platform.value,
+        )
+        with self._task_coordinator.hold(record.api_url, record.profile_id):
             client = self._client_factory(record.api_url)
             cdp_endpoint = client.open_profile(record.profile_id)
             source_url = build_source_url(request)
@@ -159,11 +219,10 @@ class SocialPostBrowserBackend:
                 source_url=source_url,
                 posts=posts,
                 truncated=truncated,
+                next_cursor=(posts[-1].post_id if truncated and posts else None),
                 warnings=warnings,
                 observed_at=datetime.now(UTC),
             )
-        finally:
-            lock.release()
 
 
 XPostBrowserBackend = SocialPostBrowserBackend
@@ -172,12 +231,16 @@ XPostBrowserBackend = SocialPostBrowserBackend
 def build_source_url(request: BrowsePostsInput) -> str:
     if request.source is BrowseSource.URL:
         assert request.start_url is not None
+        if request.platform is BrowsePlatform.TELEGRAM:
+            return _normalize_telegram_source_url(str(request.start_url))
         return str(request.start_url)
     if request.platform is BrowsePlatform.X:
         return _build_x_source_url(request)
     if request.platform is BrowsePlatform.DOUYIN:
         return _build_douyin_source_url(request)
-    return _build_xhs_source_url(request)
+    if request.platform is BrowsePlatform.XIAOHONGSHU:
+        return _build_xhs_source_url(request)
+    return _build_telegram_source_url(request)
 
 
 def build_x_source_url(request: BrowsePostsInput) -> str:
@@ -240,6 +303,24 @@ def _build_xhs_source_url(request: BrowsePostsInput) -> str:
         key = quote(request.user_key or "", safe="")
         return f"https://www.xiaohongshu.com/user/profile/{key}"
     return "https://www.xiaohongshu.com/explore"
+
+
+def _build_telegram_source_url(request: BrowsePostsInput) -> str:
+    key = (request.user_key or "").strip().lstrip("@")
+    return f"https://web.telegram.org/a/#@{quote(key, safe='')}"
+
+
+def _normalize_telegram_source_url(value: str) -> str:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host == "web.telegram.org":
+        return value
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        raise CrawlerError(ErrorCode.INVALID_REQUEST, "Telegram 地址缺少频道或群组标识。")
+    if parts[0] == "c" and len(parts) >= 2 and parts[1].isdigit():
+        return f"https://web.telegram.org/a/#-100{parts[1]}"
+    return f"https://web.telegram.org/a/#@{quote(parts[0].lstrip('@'), safe='')}"
 
 
 def normalize_rows(
@@ -306,6 +387,18 @@ def _post_identity(
             return None
         post_id = match.group(1)
         return f"https://www.douyin.com/video/{post_id}", post_id, None, None
+    if platform is BrowsePlatform.TELEGRAM:
+        if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+            return None
+        private_match = _TELEGRAM_PRIVATE_POST_PATH.match(parsed.path)
+        if private_match:
+            channel_id, post_id = private_match.groups()
+            return f"https://t.me/c/{channel_id}/{post_id}", post_id, channel_id, None
+        public_match = _TELEGRAM_PUBLIC_POST_PATH.match(parsed.path)
+        if not public_match:
+            return None
+        handle, post_id = public_match.groups()
+        return f"https://t.me/{handle}/{post_id}", post_id, handle, handle
     match = _XHS_POST_PATH.match(parsed.path)
     if not (host == "xiaohongshu.com" or host.endswith(".xiaohongshu.com")) or not match:
         return None
@@ -321,16 +414,19 @@ def _post_identity(
     return canonical, post_id, None, None
 
 
-def _extract_rows(page: Page, platform: BrowsePlatform) -> list[dict[str, Any]]:
+def _extract_rows(page: Page, request: BrowsePostsInput) -> list[dict[str, Any]]:
+    platform = request.platform
     if platform is BrowsePlatform.X:
         return _extract_x_rows(page)
     if platform is BrowsePlatform.DOUYIN:
         return _extract_douyin_rows(page)
-    return _extract_xhs_rows(page)
+    if platform is BrowsePlatform.XIAOHONGSHU:
+        return _extract_xhs_rows(page)
+    return _extract_telegram_rows(page, request)
 
 
 def _extract_x_rows(page: Page) -> list[dict[str, Any]]:
-    return page.locator('article[data-testid="tweet"]').evaluate_all(
+    return page.locator(_POST_SELECTORS[BrowsePlatform.X]).evaluate_all(
         r"""
         (articles) => articles.map((article) => {
           const statusLinks = [...article.querySelectorAll('a[href*="/status/"]')];
@@ -361,9 +457,7 @@ def _extract_x_rows(page: Page) -> list[dict[str, Any]]:
 
 
 def _extract_douyin_rows(page: Page) -> list[dict[str, Any]]:
-    return page.locator(
-        'a[href*="/video/"], a[href*="/note/"], [data-aweme-id], [id^="waterfall_item_"]'
-    ).evaluate_all(
+    return page.locator(_POST_SELECTORS[BrowsePlatform.DOUYIN]).evaluate_all(
         r"""
         (nodes) => nodes.map((node) => {
           const waterfall = node.matches('[id^="waterfall_item_"]')
@@ -394,7 +488,7 @@ def _extract_douyin_rows(page: Page) -> list[dict[str, Any]]:
 
 
 def _extract_xhs_rows(page: Page) -> list[dict[str, Any]]:
-    return page.locator('a[href*="/explore/"], a[href*="/discovery/item/"]').evaluate_all(
+    return page.locator(_POST_SELECTORS[BrowsePlatform.XIAOHONGSHU]).evaluate_all(
         r"""
         (links) => links.map((link) => {
           const href = link.getAttribute('href') || '';
@@ -418,12 +512,125 @@ def _extract_xhs_rows(page: Page) -> list[dict[str, Any]]:
     )
 
 
+def _extract_telegram_rows(page: Page, request: BrowsePostsInput) -> list[dict[str, Any]]:
+    rows = page.locator(_POST_SELECTORS[BrowsePlatform.TELEGRAM]).evaluate_all(
+        r"""
+        (messages) => messages.map((message) => {
+          const messageId = message.getAttribute('data-message-id') ||
+            (message.id || '').replace(/^message-/, '');
+          const text = message.querySelector('.text-content')?.textContent?.trim() ||
+            message.querySelector('.message-content')?.textContent?.trim() || null;
+          const meta = message.querySelector('.MessageMeta')?.textContent?.trim() || null;
+          const views = message.querySelector('.MessageMeta .message-views, [class*="views"]')?.textContent?.trim() || meta;
+          const media = [...message.querySelectorAll('.media-inner')];
+          return {
+            message_id: messageId,
+            text,
+            views,
+            has_image: media.some((node) => Boolean(node.querySelector('img.full-media, img[src^="blob:"]'))),
+            has_video: media.some((node) => Boolean(node.querySelector('video'))),
+          };
+        }).filter((row) => /^\d+$/.test(row.message_id || ''))
+        """
+    )
+    prefix, author_id, author_handle = _telegram_post_prefix(request, page.url)
+    normalized = []
+    # Telegram renders older messages above newer messages; return newest first.
+    for row in reversed(rows):
+        item = dict(row)
+        item["url"] = f"{prefix}/{item.pop('message_id')}"
+        item["author_id"] = author_id
+        item["author_name"] = author_handle
+        normalized.append(item)
+    return normalized
+
+
+def _telegram_post_prefix(
+    request: BrowsePostsInput,
+    current_url: str,
+) -> tuple[str, str | None, str | None]:
+    if request.source is BrowseSource.USER and request.user_key:
+        handle = request.user_key.strip().lstrip("@")
+        return f"https://t.me/{handle}", handle, handle
+    if request.start_url is not None:
+        parsed = urlsplit(str(request.start_url))
+        host = (parsed.hostname or "").lower()
+        parts = [part for part in parsed.path.split("/") if part]
+        if host in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"} and parts:
+            if parts[0] == "c" and len(parts) >= 2:
+                return f"https://t.me/c/{parts[1]}", parts[1], None
+            handle = parts[0].lstrip("@")
+            return f"https://t.me/{handle}", handle, handle
+    fragment = urlsplit(current_url).fragment
+    if fragment.startswith("-100") and fragment[4:].split("_")[0].isdigit():
+        channel_id = fragment[4:].split("_")[0]
+        return f"https://t.me/c/{channel_id}", channel_id, None
+    raise CrawlerError(
+        ErrorCode.BROWSE_FAILED,
+        "无法确定 Telegram 频道标识，请使用 t.me 频道地址或频道用户名。",
+    )
+
+
+def _wait_for_initial_posts(page: Page, request: BrowsePostsInput) -> None:
+    """Wait for asynchronously hydrated result cards before declaring a page empty.
+
+    Douyin's search shell reaches ``domcontentloaded`` several seconds before its
+    waterfall cards are attached. The scrolling loop used to count those empty
+    checks as stagnant rounds and exit before the search response was rendered.
+    """
+    timeout_ms = min(
+        int(request.navigation_timeout_seconds * 1_000),
+        max(8_000, request.settle_after_scroll_ms * 6),
+    )
+    try:
+        page.wait_for_selector(
+            _POST_SELECTORS[request.platform],
+            state="attached",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError:
+        # Empty searches and platform-side loading failures are reported through
+        # the existing warning after the normal extraction pass.
+        return
+
+
+def _wait_for_restored_tabs(context: Any) -> None:
+    """Give BitBrowser half a second to restore its configured/history tabs."""
+    pages = [page for page in context.pages if not page.is_closed()]
+    if pages:
+        pages[-1].wait_for_timeout(500)
+    else:
+        sleep(0.5)
+
+
+def _existing_platform_page(pages: list[Page], platform: BrowsePlatform) -> Page | None:
+    domains = {
+        BrowsePlatform.X: ("x.com", "twitter.com"),
+        BrowsePlatform.DOUYIN: ("douyin.com",),
+        BrowsePlatform.XIAOHONGSHU: ("xiaohongshu.com",),
+        BrowsePlatform.TELEGRAM: ("web.telegram.org",),
+    }[platform]
+    candidates: list[Page] = []
+    for page in pages:
+        if page.is_closed():
+            continue
+        host = (urlsplit(page.url).hostname or "").lower().rstrip(".")
+        if any(host == domain or host.endswith(f".{domain}") for domain in domains):
+            candidates.append(page)
+    return candidates[-1] if candidates else None
+
+
+def _same_navigation_url(current: str, target: str) -> bool:
+    return current.rstrip("/") == target.rstrip("/")
+
+
 def _raise_if_login_required(page: Page, platform: BrowsePlatform) -> None:
     path = urlsplit(page.url).path.lower()
     login_paths = {
         BrowsePlatform.X: ("/i/flow/login", "/login"),
         BrowsePlatform.DOUYIN: ("/passport/login",),
         BrowsePlatform.XIAOHONGSHU: ("/login",),
+        BrowsePlatform.TELEGRAM: ("/auth", "/login"),
     }[platform]
     if any(path.startswith(prefix) for prefix in login_paths):
         raise CrawlerError(
@@ -432,15 +639,56 @@ def _raise_if_login_required(page: Page, platform: BrowsePlatform) -> None:
         )
 
 
-def _raise_if_platform_challenge(page: Page, platform: BrowsePlatform) -> None:
-    title = page.title().strip().lower()
-    challenge_markers = ("验证码", "安全验证", "captcha", "verify")
-    if any(marker in title for marker in challenge_markers):
-        raise CrawlerError(
-            ErrorCode.PLATFORM_UNAVAILABLE,
-            f"{_PLATFORM_LABEL[platform]} 要求完成安全验证。请在该比特浏览器窗口中处理后再试。",
-            retryable=False,
-        )
+def _platform_challenge_visible(page: Page) -> bool:
+    """Detect visible verification UI without attempting to solve it."""
+    try:
+        title = page.title().strip().lower()
+    except Exception:
+        title = ""
+    if any(marker in title for marker in ("验证码", "安全验证", "captcha", "verify")):
+        return True
+
+    try:
+        if page.locator(_CHALLENGE_SELECTORS).first.is_visible(timeout=300):
+            return True
+    except Exception:
+        pass
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=500)
+    except Exception:
+        body_text = ""
+    return any(marker in body_text for marker in _CHALLENGE_TEXT_MARKERS)
+
+
+def _raise_if_platform_challenge(
+    page: Page,
+    platform: BrowsePlatform,
+    *,
+    wait_timeout_ms: int = 0,
+) -> None:
+    if not _platform_challenge_visible(page):
+        return
+
+    deadline = monotonic() + max(0, wait_timeout_ms) / 1_000
+    while monotonic() < deadline:
+        remaining_ms = max(1, int((deadline - monotonic()) * 1_000))
+        page.wait_for_timeout(min(1_000, remaining_ms))
+        if not _platform_challenge_visible(page):
+            # Verification overlays can disappear briefly while reloading. Wait
+            # once more before resuming extraction to avoid reading the old DOM.
+            page.wait_for_timeout(500)
+            if not _platform_challenge_visible(page):
+                return
+
+    raise CrawlerError(
+        ErrorCode.PLATFORM_UNAVAILABLE,
+        (
+            f"{_PLATFORM_LABEL[platform]} 弹出了图片或安全验证，等待手动处理已超时。"
+            "请在对应比特浏览器窗口完成验证后重试；Agent 不会自动破解验证码。"
+        ),
+        retryable=True,
+    )
 
 
 def _metric_number(value: Any) -> int | None:

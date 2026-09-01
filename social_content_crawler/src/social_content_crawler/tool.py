@@ -21,6 +21,7 @@ from .contracts import (
     DownloadOutput,
     MediaInfo,
     ToolSpec,
+    TelegramDownloadScope,
 )
 from .errors import CrawlerError, ErrorCode
 from .ports import AuditSink, DownloaderBackend, RateLimiter, ToolContext, UrlPolicy
@@ -28,7 +29,7 @@ from .ports import AuditSink, DownloaderBackend, RateLimiter, ToolContext, UrlPo
 
 TOOL_SPEC = ToolSpec(
     name="social.download_media",
-    version="1.7.0",
+    version="1.9.0",
     description=(
         "Extract metadata or download social-media media; registered BitBrowser "
         "sessions use the Profile's proxy route as well as its platform cookies."
@@ -89,7 +90,7 @@ class SocialMediaDownloadTool:
                 f"{TOOL_SPEC.rate_limit_bucket}:{_host(request.urls[0])}",
                 context.tenant_id,
             )
-            output_directory = self._create_output_directory(context, input_hash)
+            output_directory = self._create_output_directory(context, input_hash, request)
             raw_items = await asyncio.to_thread(self._backend.run, request, output_directory)
             artifacts = _artifacts(output_directory)
             maximum_bytes = request.max_file_size_mb * 1024 * 1024
@@ -99,7 +100,12 @@ class SocialMediaDownloadTool:
                     "downloaded artifact exceeds the configured file-size limit",
                 )
             maximum_total_bytes = request.max_total_size_mb * 1024 * 1024
-            if sum(artifact.size_bytes for artifact in artifacts) > maximum_total_bytes:
+            counted_artifacts = [
+                artifact
+                for artifact in artifacts
+                if Path(artifact.path).name != "telegram-channel-manifest.jsonl"
+            ]
+            if sum(artifact.size_bytes for artifact in counted_artifacts) > maximum_total_bytes:
                 raise CrawlerError(
                     ErrorCode.LIMIT_EXCEEDED,
                     "downloaded artifacts exceed the configured total-size limit",
@@ -113,11 +119,15 @@ class SocialMediaDownloadTool:
                 network_route=(
                     str(getattr(self._backend, "last_network_route", "direct"))
                 ),
+                checkpoint_path=getattr(self._backend, "last_checkpoint_path", None),
+                completed=bool(getattr(self._backend, "last_completed", True)),
+                stop_reason=str(getattr(self._backend, "last_stop_reason", "completed")),
+                scanned_count=int(getattr(self._backend, "last_scanned_count", len(raw_items))),
             )
             return output
         except CrawlerError as exc:
             error = exc
-            if output_directory is not None:
+            if output_directory is not None and request.telegram_scope is not TelegramDownloadScope.CHANNEL:
                 shutil.rmtree(output_directory, ignore_errors=True)
             raise
         except Exception as exc:
@@ -126,7 +136,7 @@ class SocialMediaDownloadTool:
                 "unexpected downloader failure",
                 retryable=False,
             )
-            if output_directory is not None:
+            if output_directory is not None and request.telegram_scope is not TelegramDownloadScope.CHANNEL:
                 shutil.rmtree(output_directory, ignore_errors=True)
             raise error from exc
         finally:
@@ -148,13 +158,34 @@ class SocialMediaDownloadTool:
                 )
             )
 
-    def _create_output_directory(self, context: ToolContext, input_hash: str) -> Path:
+    def _create_output_directory(
+        self,
+        context: ToolContext,
+        input_hash: str,
+        request: DownloadInput,
+    ) -> Path:
         tenant = re.sub(r"[^A-Za-z0-9_.-]", "_", context.tenant_id)[:64] or "tenant"
-        invocation = f"{input_hash[:12]}-{uuid.uuid4().hex[:12]}"
+        if request.telegram_scope is TelegramDownloadScope.CHANNEL:
+            stable_payload = json.dumps(
+                {
+                    "session_ref": request.session_ref,
+                    "url": str(request.urls[0]),
+                    "media_format": request.media_format,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            stable_hash = hashlib.sha256(stable_payload.encode()).hexdigest()[:24]
+            invocation = f"telegram-channel-{stable_hash}"
+        else:
+            invocation = f"{input_hash[:12]}-{uuid.uuid4().hex[:12]}"
         destination = (self._output_root / tenant / invocation).resolve()
         if not destination.is_relative_to(self._output_root):
             raise CrawlerError(ErrorCode.CONFIGURATION_ERROR, "unsafe output directory")
-        destination.mkdir(parents=True, exist_ok=False)
+        destination.mkdir(
+            parents=True,
+            exist_ok=request.telegram_scope is TelegramDownloadScope.CHANNEL,
+        )
         return destination
 
 

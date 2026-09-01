@@ -3,7 +3,7 @@
 项目提供四个相互独立的社媒 Tool：
 
 1. `browser.operate`：在已授权的比特浏览器会话中观察页面、导航、点击、输入搜索词、按键、滚动和翻页。
-2. `social.browse_posts`：通过已授权的比特浏览器会话浏览抖音、小红书或 X，搜索并获取帖子 URL 与元数据。
+2. `social.browse_posts`：通过已授权的比特浏览器会话浏览抖音、小红书、X 或 Telegram Web，搜索/遍历并获取帖子 URL 与元数据。
 3. `social.download_media`：根据帖子 URL 下载媒体；同时提供 PostDrop 桌面 App。
 4. `social.publish_x_post`：在用户确认 Agent 高风险计划后，通过已登录的比特浏览器发布一条 X 帖子。
 
@@ -17,7 +17,8 @@
 - `observe`：返回页面标题、正文摘要和最多 100 个可交互元素，元素以短期 `element_ref` 标识。
 - `navigate`：打开公开、无凭据的 HTTPS 页面。
 - `click`、`input`：可使用 `element_ref`、CSS selector、ARIA role/name 或精确文本定位。
-- `press`、`scroll`：支持 Enter、PageUp/PageDown、方向键等受限按键和上下滚动。
+- `press`、`scroll`：支持 Enter、PageUp/PageDown、方向键等受限按键和指定方向滚动。
+- `swipe_up`、`swipe_down`：提供语义明确的上划、下划操作；幅度由 `scroll_y` 控制。
 - `back`、`forward`、`reload`、`wait`：完成常见分页与页面状态等待。
 
 推荐先 `observe`，再用返回的 `element_ref` 点击或输入。每个 `session_ref` 串行执行，
@@ -47,14 +48,23 @@ CDP 连接中完成。
 
 ## social.browse_posts
 
-当前支持抖音、小红书和 X / Twitter，使用 PostDrop 已注册的、与平台绑定的 `session_ref` 连接对应比特浏览器 Profile：
+当前支持抖音、小红书、X / Twitter 和 Telegram Web，使用 PostDrop 已注册的、与平台绑定的 `session_ref` 连接对应比特浏览器 Profile：
 
 - 抖音：关键词搜索（综合、视频、用户）、用户主页作品、首页推荐流、指定抖音页面。
 - 小红书：关键词搜索（综合、最新、视频）、用户主页笔记、发现页、指定小红书页面。
 - X / Twitter：关键词搜索（热门、最新、媒体）、用户主页（帖子、媒体、回复）、时间线、指定页面。
+- Telegram Web：指定公开频道、已加入频道或群组；按消息提取图片、视频和随附文本。公开入口可传 `https://t.me/<频道名>`，私有频道/群组可传当前 Telegram Web 地址或 `t.me/c/...` 地址。
 - 输出去重后的帖子 URL、帖子 ID、作者、正文、语言、发布时间、图片/视频类型和可见互动量。
 - 单次最多返回 100 条；滚动次数、页面超时和滚动等待均有上限。
 - 同一个 `session_ref` 同一进程内只允许一个浏览任务，避免并发操作同一 Profile。
+
+Telegram Web 全量下载已下沉到 `social.download_media` 的确定性执行器：对频道地址传
+`telegram_scope="channel"` 后，单次 Tool 调用会在页面内持续向上遍历历史消息，保存图片、
+视频和 UTF-8 文本，并在同一稳定输出目录逐条追加 `telegram-channel-manifest.jsonl`。
+重复执行相同会话、频道和媒体格式时会读取检查点并跳过已完成消息；任务受消息数、单文件和
+总容量上限约束，输出以 `completed`、`stop_reason`、`scanned_count` 和 `checkpoint_path`
+明确说明是否到达频道顶部。Telegram 的认证状态保存在浏览器 Profile 中，注册和执行均不
+导出账号凭据，媒体请求继续经过该 Profile 的代理。
 
 Agent 调用示例：
 
@@ -103,7 +113,9 @@ async def browse() -> None:
 asyncio.run(browse())
 ```
 
-浏览 Backend 只调用比特浏览器 `/browser/open` 获取本机 CDP 地址，然后由 Playwright 新建临时标签页完成只读导航。采集完成后关闭临时标签页，保留 Profile 进程。它不会自动登录、提交表单、点赞、转发或关注，也不会调用修改代理、指纹或 Cookie 的接口。发布只能经由独立 `social.publish_x_post` 和一次性授权完成。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
+浏览 Backend 先通过比特浏览器 `/browser/pids/alive` 和 `/browser/ports` 判断并复用已打开的 Profile；只有窗口未运行时才调用 `/browser/open`。连接后等待 500ms 让历史或平台标签页恢复，已有目标平台标签页时直接复用，没有时才新建临时标签页。采集完成后只关闭 Tool 自己新建的临时标签页，保留用户原有标签页和 Profile 进程。它不会自动登录、提交表单、点赞、转发或关注，也不会调用修改代理、指纹或 Cookie 的接口。发布只能经由独立 `social.publish_x_post` 和一次性授权完成。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
+
+同一个比特浏览器 Profile 同一时刻只允许一个任务。浏览、通用页面操作、带会话下载和 X 发布共享 Profile 级互斥锁；SocialAgent 与单独运行的 Tool GUI 之间也通过本机锁文件互斥。冲突任务返回可重试的 `session_busy`，不会同时点击或导航同一个窗口。
 
 实现分层参考了 [MediaCrawler](https://github.com/NanmiCoder/MediaCrawler) 的“平台适配器 + Playwright/CDP + 登录态复用”思路，但没有复制其签名算法、私有接口调用或源代码。MediaCrawler 使用[非商用学习许可证](https://github.com/NanmiCoder/MediaCrawler/blob/main/LICENSE)，本项目的实现和使用必须独立遵守目标平台规则、账号授权边界及适用法律。
 
@@ -119,13 +131,16 @@ social.browse_posts
 
 ## 桌面 App
 
+PostDrop 中粘贴 `https://t.me/<频道>` 或 `https://t.me/c/<频道ID>` 会自动进入频道遍历模式；
+粘贴带消息 ID 的地址仍只下载单条消息。频道模式必须选择对应的 Telegram `session_ref`。
+
 桌面端使用 Qt for Python（PySide6），不是 Web 页面，不需要浏览器或本地 HTTP 服务。主要功能：
 
 - 粘贴或拖入公开社媒帖子 HTTPS 地址。
 - 支持直接粘贴抖音/小红书 App 生成的整段中文分享文案，自动提取其中短链。
 - 自动兼容抖音“精选”页面的 `modal_id` 链接并转换为标准作品地址。
 - 抖音遇到站点校验时，可在用户允许后读取一次本机浏览器会话；成功后只缓存抖音的匿名站点 Cookie，后续下载优先复用缓存。
-- 抖音、小红书和 X / Twitter 支持选择已经手动登录的比特浏览器 Profile；PostDrop 为每个平台分别生成可供 Agent 使用的 `session_ref`。
+- 抖音、小红书、X / Twitter 和 Telegram Web 支持选择已经手动登录的比特浏览器 Profile；PostDrop 为每个平台分别生成可供 Agent 使用的 `session_ref`。
 - 选择音视频、仅视频（无声）或仅音频；三种模式语义互不重叠。
 - 可选保存封面、字幕。
 - 显示实时下载进度、速度和预计时间。
@@ -134,7 +149,7 @@ social.browse_posts
 - 内置跨平台 FFmpeg，可自动合并 B 站、YouTube 等平台分离提供的最佳视频流和音频流。
 - 默认保存到系统“下载/PostDrop”目录。
 
-## 支持平台（13 个）
+## 支持平台（14 个）
 
 桌面界面和域名白名单共用 `PLATFORM_CATALOG`，以下清单是当前版本的统一能力来源：
 
@@ -145,6 +160,7 @@ social.browse_posts
 | 哔哩哔哩 | `bilibili.com`、`b23.tv` | 视频、音频 | 专用 extractor |
 | 微博 | `weibo.com` | 视频 | 专用 extractor |
 | X / Twitter | `x.com`、`twitter.com` | 视频、音频 | 专用 extractor |
+| Telegram Web | `t.me`、`telegram.me`、`web.telegram.org` | 视频、图片、文本 | 比特浏览器页面适配器 |
 | YouTube | `youtube.com`、`youtu.be` | 视频、音频、字幕 | 专用 extractor |
 | TikTok | `tiktok.com` | 视频 | 专用 extractor |
 | Instagram | `instagram.com` | 视频 | 专用 extractor |
@@ -154,7 +170,7 @@ social.browse_posts
 | Vimeo | `vimeo.com` | 视频 | 专用 extractor |
 | Threads* | `threads.net` | 页面中的嵌入视频 | 通用解析，尽力支持 |
 
-其中 **12 个平台使用专用 extractor**；Threads 没有独立 extractor，仅在公开页面能被通用解析器识别到媒体时可下载，因此界面中标记为 `Threads*`。
+其中 **12 个平台使用 yt-dlp 专用 extractor**；Telegram Web 使用已登录比特浏览器页面适配器；Threads 没有独立 extractor，仅在公开页面能被通用解析器识别到媒体时可下载，因此界面中标记为 `Threads*`。
 
 ### 中国大陆平台
 

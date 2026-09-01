@@ -6,6 +6,10 @@ from urllib.parse import parse_qs, urlsplit
 from social_content_crawler.browse_backend import (
     XPostBrowserBackend,
     _extract_douyin_rows,
+    _extract_telegram_rows,
+    _existing_platform_page,
+    _raise_if_platform_challenge,
+    _wait_for_initial_posts,
     _metric_number,
     build_source_url,
     build_x_source_url,
@@ -13,6 +17,7 @@ from social_content_crawler.browse_backend import (
 )
 from social_content_crawler.browse_contracts import BrowsePostsInput
 from social_content_crawler.browse_contracts import BrowsePlatform
+from social_content_crawler.errors import CrawlerError, ErrorCode
 
 
 SESSION_REF = "sess_x_abcdefghijklmnopqrstuvwx"
@@ -167,6 +172,111 @@ def test_douyin_collector_includes_new_aweme_id_cards() -> None:
     assert rows[0]["url"].endswith("/video/7679489315499543859")
 
 
+def test_waits_for_douyin_waterfall_cards_before_extracting() -> None:
+    captured = {}
+
+    class FakePage:
+        def wait_for_selector(self, selector, *, state, timeout):
+            captured.update(selector=selector, state=state, timeout=timeout)
+
+    request = BrowsePostsInput(
+        platform="douyin",
+        session_ref="sess_douyin_abcdefghijklmnopqrstuvwx",
+        source="search",
+        view="top",
+        query="美女",
+        navigation_timeout_seconds=30,
+        settle_after_scroll_ms=900,
+    )
+
+    _wait_for_initial_posts(FakePage(), request)
+
+    assert "waterfall_item_" in captured["selector"]
+    assert captured["state"] == "attached"
+    assert captured["timeout"] == 8_000
+
+
+def test_reuses_existing_douyin_tab_instead_of_unrelated_tab() -> None:
+    class FakePage:
+        def __init__(self, url):
+            self.url = url
+
+        def is_closed(self):
+            return False
+
+    unrelated = FakePage("https://example.com/")
+    douyin = FakePage("https://www.douyin.com/")
+
+    assert _existing_platform_page(
+        [douyin, unrelated],
+        BrowsePlatform.DOUYIN,
+    ) is douyin
+
+
+def test_waits_for_manual_image_verification_then_continues() -> None:
+    class FakeChallengeLocator:
+        def __init__(self, page):
+            self.page = page
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self, *, timeout):
+            assert timeout == 300
+            self.page.challenge_checks += 1
+            return self.page.challenge_checks == 1
+
+    class FakeBodyLocator:
+        def inner_text(self, *, timeout):
+            assert timeout == 500
+            return "搜索结果"
+
+    class FakePage:
+        challenge_checks = 0
+
+        def title(self):
+            return "抖音搜索"
+
+        def locator(self, selector):
+            return FakeBodyLocator() if selector == "body" else FakeChallengeLocator(self)
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds > 0
+
+    _raise_if_platform_challenge(
+        FakePage(),
+        BrowsePlatform.DOUYIN,
+        wait_timeout_ms=1_000,
+    )
+
+
+def test_unresolved_image_verification_is_retryable() -> None:
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self, *, timeout):
+            return True
+
+    class FakePage:
+        def title(self):
+            return "抖音搜索"
+
+        def locator(self, selector):
+            return FakeLocator()
+
+    try:
+        _raise_if_platform_challenge(FakePage(), BrowsePlatform.DOUYIN)
+    except CrawlerError as exc:
+        assert exc.code == ErrorCode.PLATFORM_UNAVAILABLE
+        assert exc.retryable is True
+        assert "完成验证后重试" in str(exc)
+    else:
+        raise AssertionError("expected a retryable challenge error")
+
+
 def test_normalizes_douyin_and_xiaohongshu_post_urls() -> None:
     douyin = normalize_rows(
         BrowsePlatform.DOUYIN,
@@ -190,3 +300,36 @@ def test_metric_parser_supports_compact_and_chinese_units() -> None:
     assert _metric_number("2万") == 20_000
     assert _metric_number("1.5亿") == 150_000_000
     assert _metric_number(None) is None
+
+
+def test_builds_and_extracts_telegram_channel_messages_newest_first() -> None:
+    request = BrowsePostsInput(
+        platform="telegram",
+        session_ref="sess_telegram_abcdefghijklmnopqrstuvwx",
+        source="url",
+        view="posts",
+        start_url="https://t.me/weme_download",
+        max_items=10,
+    )
+    assert build_source_url(request) == "https://web.telegram.org/a/#@weme_download"
+
+    class FakeLocator:
+        def evaluate_all(self, script):
+            assert "data-message-id" in script
+            return [
+                {"message_id": "10", "text": "older", "has_image": True},
+                {"message_id": "11", "text": "newer", "has_video": True},
+            ]
+
+    class FakePage:
+        url = "https://web.telegram.org/a/#-1001634371164"
+
+        def locator(self, selector):
+            assert "Message" in selector
+            return FakeLocator()
+
+    rows = _extract_telegram_rows(FakePage(), request)
+    posts = normalize_rows(BrowsePlatform.TELEGRAM, rows, 10)
+    assert [post.post_id for post in posts] == ["11", "10"]
+    assert str(posts[0].url) == "https://t.me/weme_download/11"
+    assert posts[0].media_types == ["video"]

@@ -18,6 +18,11 @@ class MediaFormat(StrEnum):
     AUDIO = "audio"
 
 
+class TelegramDownloadScope(StrEnum):
+    MESSAGES = "messages"
+    CHANNEL = "channel"
+
+
 class BrowserCookieSource(StrEnum):
     NONE = "none"
     AUTO = "auto"
@@ -41,6 +46,8 @@ class DownloadInput(BaseModel):
     max_total_size_mb: int = Field(default=1_000, ge=1, le=5_000)
     max_duration_seconds: int = Field(default=3_600, ge=1, le=21_600)
     request_timeout_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
+    telegram_scope: TelegramDownloadScope = TelegramDownloadScope.MESSAGES
+    telegram_max_messages: int = Field(default=2_000, ge=1, le=20_000)
     write_thumbnail: bool = False
     write_subtitles: bool = False
     browser_cookie_source: BrowserCookieSource = BrowserCookieSource.NONE
@@ -58,6 +65,13 @@ class DownloadInput(BaseModel):
                 raise ValueError("only HTTPS URLs are allowed")
             if url.username or url.password:
                 raise ValueError("URLs containing credentials are not allowed")
+        if self.telegram_scope is TelegramDownloadScope.CHANNEL:
+            if len(self.urls) != 1:
+                raise ValueError("Telegram channel download accepts exactly one channel URL")
+            if not self.session_ref or not self.session_ref.startswith("sess_telegram_"):
+                raise ValueError("Telegram channel download requires a Telegram session_ref")
+            if self.media_format is MediaFormat.AUDIO:
+                raise ValueError("Telegram channel download does not support audio-only mode")
         return self
 
 
@@ -97,6 +111,10 @@ class DownloadOutput(BaseModel):
     artifacts: list[DownloadedArtifact]
     output_directory: str | None = None
     network_route: Literal["direct", "bitbrowser_profile_proxy"] = "direct"
+    checkpoint_path: str | None = None
+    completed: bool = True
+    stop_reason: Literal["completed", "message_limit", "size_limit", "stagnant"] = "completed"
+    scanned_count: int = 0
 
 
 class ToolSpec(BaseModel):

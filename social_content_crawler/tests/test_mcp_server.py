@@ -13,3 +13,6 @@ def test_plugin_mcp_exposes_crawler_tools() -> None:
         "download_media",
         "publish_x_post",
     }
+    download_schema = mcp._tool_manager._tools["download_media"].parameters
+    assert download_schema["properties"]["telegram_scope"]["default"] == "messages"
+    assert download_schema["properties"]["telegram_max_messages"]["default"] == 2000

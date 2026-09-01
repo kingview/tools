@@ -51,6 +51,13 @@ PLATFORM_CATALOG: tuple[PlatformDefinition, ...] = (
         content_types=("视频", "音频"),
     ),
     PlatformDefinition(
+        key="telegram",
+        display_name="Telegram Web",
+        domains=("t.me", "telegram.me", "web.telegram.org"),
+        extractor="TelegramWeb",
+        content_types=("视频", "图片", "文本"),
+    ),
+    PlatformDefinition(
         key="youtube",
         display_name="YouTube",
         domains=("youtube.com", "youtu.be"),
@@ -116,4 +123,3 @@ def default_allowed_domains() -> frozenset[str]:
 
 def supported_platform_label(separator: str = "   ·   ") -> str:
     return separator.join(platform.display_name for platform in PLATFORM_CATALOG)
-

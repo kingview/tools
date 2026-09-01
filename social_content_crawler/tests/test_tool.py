@@ -69,7 +69,7 @@ def test_download_normalizes_artifact_and_audits(tmp_path: Path) -> None:
     assert Path(result.artifacts[0].path).is_relative_to(tmp_path)
     assert result.network_route == "direct"
     assert audit.events[0].event_type == "tool.succeeded"
-    assert audit.events[0].tool_version == "1.7.0"
+    assert audit.events[0].tool_version == "1.9.0"
 
 
 def test_metadata_only_is_dry_run(tmp_path: Path) -> None:
@@ -109,6 +109,23 @@ def test_input_accepts_only_opaque_session_references() -> None:
         DownloadInput(
             urls=["https://x.com/author/status/1"],
             session_ref="raw-cookie=value",
+        )
+
+
+def test_telegram_channel_scope_requires_one_telegram_session() -> None:
+    request = DownloadInput(
+        urls=["https://t.me/weme_download"],
+        session_ref="sess_telegram_abcdefghijklmnopqrstuvwx",
+        telegram_scope="channel",
+        telegram_max_messages=5_000,
+    )
+    assert request.telegram_scope == "channel"
+    assert request.telegram_max_messages == 5_000
+    with pytest.raises(ValidationError):
+        DownloadInput(
+            urls=["https://t.me/weme_download"],
+            session_ref="sess_x_abcdefghijklmnopqrstuvwx",
+            telegram_scope="channel",
         )
 
 

@@ -11,6 +11,7 @@ class BrowsePlatform(StrEnum):
     X = "x"
     DOUYIN = "douyin"
     XIAOHONGSHU = "xiaohongshu"
+    TELEGRAM = "telegram"
 
 
 class BrowseSource(StrEnum):
@@ -34,7 +35,7 @@ class BrowsePostsInput(BaseModel):
 
     platform: BrowsePlatform
     session_ref: str = Field(
-        pattern=r"^sess_(?:x|douyin|xhs)_[A-Za-z0-9_-]{20,80}$",
+        pattern=r"^sess_(?:x|douyin|xhs|telegram)_[A-Za-z0-9_-]{20,80}$",
         max_length=96,
     )
     source: BrowseSource
@@ -68,8 +69,13 @@ class BrowsePostsInput(BaseModel):
                 BrowseSource.TIMELINE: {BrowseView.TOP},
                 BrowseSource.URL: {BrowseView.TOP},
             },
+            BrowsePlatform.TELEGRAM: {
+                BrowseSource.USER: {BrowseView.POSTS},
+                BrowseSource.URL: {BrowseView.POSTS},
+            },
         }
-        if self.view not in allowed_views[self.platform][self.source]:
+        platform_sources = allowed_views[self.platform]
+        if self.source not in platform_sources or self.view not in platform_sources[self.source]:
             raise ValueError(
                 f"view={self.view} is not valid for platform={self.platform}, source={self.source}"
             )
@@ -83,6 +89,7 @@ class BrowsePostsInput(BaseModel):
             BrowsePlatform.X: "sess_x_",
             BrowsePlatform.DOUYIN: "sess_douyin_",
             BrowsePlatform.XIAOHONGSHU: "sess_xhs_",
+            BrowsePlatform.TELEGRAM: "sess_telegram_",
         }[self.platform]
         if not self.session_ref.startswith(expected_prefix):
             raise ValueError("session_ref platform does not match platform")
@@ -94,6 +101,7 @@ class BrowsePostsInput(BaseModel):
                 BrowsePlatform.X: {"x.com", "twitter.com"},
                 BrowsePlatform.DOUYIN: {"douyin.com", "iesdouyin.com"},
                 BrowsePlatform.XIAOHONGSHU: {"xiaohongshu.com", "xhslink.com"},
+                BrowsePlatform.TELEGRAM: {"t.me", "telegram.me", "web.telegram.org"},
             }[self.platform]
             if self.start_url.scheme != "https" or not any(
                 host == domain or host.endswith(f".{domain}") for domain in allowed_domains
