@@ -69,18 +69,24 @@ class PlaywrightBrowserControlAutomation:
                     _wait_for_restored_tabs(context.pages)
                 page = self._resolve_page(context.pages, request.session_ref)
                 if page is None:
-                    page = context.new_page()
+                    from .browser_lifecycle import new_task_page
+                    page = new_task_page(context, cdp_endpoint)
                 page.set_default_timeout(request.timeout_seconds * 1_000)
                 self._remember_page(page, request.session_ref)
                 pages_before = {id(item) for item in context.pages}
-                self._apply(page, request)
-                if request.wait_after_ms:
-                    page.wait_for_timeout(request.wait_after_ms)
-                opened_pages = [
-                    item
-                    for item in context.pages
-                    if id(item) not in pages_before and not item.is_closed()
-                ]
+                try:
+                    self._apply(page, request)
+                    if request.wait_after_ms:
+                        page.wait_for_timeout(request.wait_after_ms)
+                finally:
+                    opened_pages = [
+                        item
+                        for item in context.pages
+                        if id(item) not in pages_before and not item.is_closed()
+                    ]
+                    from .browser_lifecycle import record_task_popup
+                    for opened_page in opened_pages:
+                        record_task_popup(opened_page, page, cdp_endpoint)
                 if opened_pages:
                     page = opened_pages[-1]
                     page.set_default_timeout(request.timeout_seconds * 1_000)

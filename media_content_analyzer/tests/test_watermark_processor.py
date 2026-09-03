@@ -24,6 +24,7 @@ from media_content_analyzer.watermark_processor import (
     VideoSamples,
     _detect_dynamic_regions,
     _detect_static_regions,
+    _dynamic_fine_masks,
     _automatic_sample_frame_count,
     _static_sample_support_bonus,
     _track_template,
@@ -275,6 +276,81 @@ def test_moving_text_overlay_is_detected_automatically() -> None:
     assert regions[0].x < 40
     assert regions[0].y < 70
     assert regions[0].confidence >= 0.75
+
+
+def test_compound_corner_watermark_detects_badge_text_and_avatar() -> None:
+    frames = []
+    height, width = 360, 640
+    random = np.random.default_rng(29)
+    avatar = np.full((50, 50, 3), 30, dtype=np.uint8)
+    cv2.circle(avatar, (25, 25), 23, (210, 80, 35), -1)
+    cv2.circle(avatar, (25, 25), 23, (255, 255, 255), 2)
+    cv2.circle(avatar, (25, 19), 8, (90, 210, 245), -1)
+    cv2.ellipse(avatar, (25, 38), (15, 10), 0, 180, 360, (90, 210, 245), -1)
+    for index in range(24):
+        frame = random.integers(55, 85, (height, width, 3), dtype=np.uint8)
+        if index < 12:
+            badge_x, badge_y = 520, 304
+            text_x, text_y = 60, 340
+            avatar_x, avatar_y = 20, 285
+        else:
+            badge_x, badge_y = 16, 14
+            text_x, text_y = 455, 49
+            avatar_x, avatar_y = 570, 20
+        cv2.rectangle(
+            frame,
+            (badge_x, badge_y),
+            (badge_x + 96, badge_y + 40),
+            (250, 250, 250),
+            -1,
+        )
+        cv2.putText(
+            frame,
+            "APP",
+            (badge_x + 13, badge_y + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (10, 10, 10),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            "ACCOUNT",
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (250, 250, 250),
+            2,
+            cv2.LINE_AA,
+        )
+        frame[avatar_y : avatar_y + 50, avatar_x : avatar_x + 50] = avatar
+        frames.append(frame)
+
+    regions = _detect_dynamic_regions(VideoSamples(frames, width, height, 8.0))
+
+    assert len(regions) >= 3
+    assert any(region.width >= 90 and region.height >= 35 for region in regions)
+    assert any(abs(region.width - region.height) <= 15 for region in regions)
+
+
+def test_dynamic_mask_fills_solid_badge_interior() -> None:
+    frame = np.full((80, 160, 3), 70, dtype=np.uint8)
+    cv2.rectangle(frame, (10, 15), (150, 65), (250, 250, 250), -1)
+    cv2.putText(
+        frame,
+        "APP",
+        (45, 51),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (10, 10, 10),
+        2,
+        cv2.LINE_AA,
+    )
+
+    mask = _dynamic_fine_masks(frame, [(5, 10, 150, 60)])[0]
+
+    assert np.count_nonzero(mask) / mask.size >= 0.55
 
 
 def test_cyclic_scrolling_overlay_can_start_after_first_sample() -> None:

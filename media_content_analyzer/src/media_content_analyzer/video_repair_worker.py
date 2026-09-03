@@ -17,10 +17,10 @@ import imageio_ffmpeg
 import numpy as np
 
 from .contracts import WatermarkRegion
+from .diagnostics import install_exception_hooks, record_exception
 from .watermark_processor import (
     _blend_temporal_reference,
     _build_bidirectional_track,
-    _dynamic_fine_masks,
     _mux_repaired_video,
     _normalize_regions,
     _static_fine_masks,
@@ -274,9 +274,11 @@ def _run_video_inpainting(
             anchor_frame = first_frame
             anchor_index = 0
         templates, edge_modes = _tracking_templates(anchor_frame, [box])
-        local_masks.append(
-            np.asarray(_dynamic_fine_masks(anchor_frame, [box])[0], dtype=np.uint8)
-        )
+        # The detector already returns a tight padded box for each moving
+        # overlay component. High-quality inpainting must cover that complete
+        # box: stroke-only masks can preserve bright interiors or reconstruct
+        # recognizable letter fragments after temporal blending.
+        local_masks.append(_solid_tracked_mask(box))
         position_tracks.append(
             _build_bidirectional_track(
                 source,
@@ -374,6 +376,11 @@ def _run_video_inpainting(
     report(100, "AI 高质量修复完成")
 
 
+def _solid_tracked_mask(box: tuple[int, int, int, int]) -> np.ndarray:
+    _, _, width, height = box
+    return np.full((height, width), 255, dtype=np.uint8)
+
+
 def _progress_path(value: object, destination: Path) -> Path | None:
     if not value:
         return None
@@ -451,6 +458,7 @@ def health_payload() -> dict[str, object]:
             "model_ready": model_path.is_file(),
         }
     except Exception as exc:
+        record_exception("media-content", "repair_worker.health", exc)
         return {"ok": False, "error_type": type(exc).__name__, "error": str(exc)}
 
 
@@ -463,6 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    install_exception_hooks("media-content")
     args = build_parser().parse_args(argv)
     try:
         if args.health:
@@ -475,6 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             raise ValueError("one of --request, --health, or --download-model is required")
     except Exception as exc:
+        record_exception("media-content", "repair_worker.execute", exc)
         payload = {"ok": False, "error_type": type(exc).__name__, "error": str(exc)}
         print(json.dumps(payload, ensure_ascii=False))
         return 2

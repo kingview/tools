@@ -10,7 +10,7 @@
 - 统一输出：`ContentAnalysisOutput`，包含 summary、分类型 tags、topics、entities、claims、evidence、confidence 和 `needs_human_review`。
 - 文案生成：以 `ContentAnalysisOutput` 为事实依据，按通用、抖音、小红书、B站、微博、Instagram、TikTok 的发布风格生成 1–5 条文案。
 - 文案控制：支持自然、种草推荐、专业、幽默、情绪共鸣、暧昧吸睛（非露骨）语气，以及长度、发布目标、补充要求和话题标签开关。
-- 水印处理：`media.process_watermark` 抽帧检测画面任意位置的固定水印，并通过归一化边缘描述子跨帧关联重复出现且位置变化的文字/Logo，自动识别高置信度动态水印。周期滚动水印不必从首个采样帧开始，视频也可以同时返回固定和动态区域。明确授权后，默认只为叠加层笔画生成细粒度 mask，以首次可靠出现的时间点建立模板，向前/向后双向跟踪并在循环跳转时全画面重新定位，再使用 OpenCV inpaint、光流对齐和时序融合修复画面；也可切换快速模式或接入独立 GPU 视频修复 Worker。手动框选保留为低置信度兜底，原文件永不覆盖。
+- 水印处理：`media.process_watermark` 抽帧检测画面任意位置的固定水印，并通过归一化边缘描述子跨帧关联重复出现且位置变化的文字、平台徽标和圆形头像，自动识别高置信度动态复合水印。周期滚动水印不必从首个采样帧开始，视频也可以同时返回固定和动态区域。明确授权后，文字使用细粒度笔画 mask，实心徽标和头像使用完整区域 mask；系统以首次可靠出现的时间点建立模板，向前/向后双向跟踪并在循环跳转时全画面重新定位，再使用 OpenCV inpaint、光流对齐和时序融合修复画面；也可切换快速模式或接入独立 GPU 视频修复 Worker。手动框选保留为低置信度兜底，原文件永不覆盖。
 - 安全：文件必须位于 Executor 配置的媒体根目录，大小和 SHA-256 必须与下载清单一致；OCR、字幕、帖子文本和图片都作为不可信数据传给模型。
 - 运行：Agent Python API、CLI 和 PySide6 桌面 App 共用同一套 Tool、契约、缓存和审计实现。所有 Tool 客户端统一使用 PySide6/Qt 桌面框架，不混用 Web 或 Electron。
 
@@ -290,8 +290,19 @@ watermark_result = await watermark_tool.execute(
 
 ## Tool 契约
 
+开发期异常会写入 JSONL 诊断日志：Agent 调用时使用 `SOCIAL_AGENT_LOG_DIR`
+（默认 Agent 输出目录下 `.social-agent-state/logs`）；独立 macOS GUI/CLI 默认
+`~/Library/Logs/SocialAgent/`，也可用 `SOCIAL_AGENT_STATE_ROOT` 指定状态目录。
+记录分析/文案/去水印的异常链、堆栈位置、校验字段以及 OCR/ASR/模型降级原因；不记录校验输入值、
+局部变量或完整请求，密钥/Cookie/URL 查询参数脱敏。按进程 5 MiB + 3 备份轮转，
+新建日志时清理超过 10 组的非活跃进程历史日志。仅当前用户可读写，不向 MCP stdout 输出日志。
+`diagnostics.py` 和 `diagnostic_mcp.py` 由 Agent 的 `scripts/sync_diagnostics.py` 在统一插件构建前同步，
+插件自带副本，仍可独立安装。MCP 元数据携带任务/步骤/调用 ID，只用于日志关联，不影响业务参数。
+完整异常记录带 `error_id`，上层只引用同一个错误 ID；框架参数校验失败也会记录，校验输入值不落盘。
+
 - 名称：`media.analyze_content`
-- 版本：`1.1.1`
+- 版本：`1.1.2`
+- 密集文字图片的标签引用去重并限制为每标签最多 50 条，优先保留视觉证据；完整 OCR、摘要及证据列表不裁剪。过长的标签仅缩短标签展示，保留原始语义字段。内部校验异常返回字段名和错误类型，不输出原始媒体文本或模型响应。
 - 类型：`analysis`
 - 外部副作用：无
 - 幂等：是，按 artifact hash、请求参数和流水线/模型版本缓存
@@ -312,7 +323,7 @@ watermark_result = await watermark_tool.execute(
 水印处理 Tool：
 
 - 名称：`media.process_watermark`
-- 版本：`1.4.3`
+- 版本：`1.4.5`
 - 类型：`analysis` + 本地媒体衍生处理
 - 原文件：强制保留，输出包含 `derived_from_sha256`
 - 人工批准：去除模式需要；仅检测模式不修改文件

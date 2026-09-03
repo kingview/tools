@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import install_exception_hooks, record_exception
+
 import argparse
 import asyncio
 import hashlib
@@ -161,8 +163,10 @@ class AnalysisWorker(QThread):
                 )
             )
         except AnalyzerError as exc:
+            record_exception("media-content", "desktop.handled", exc)
             self.failed.emit(str(exc.code), str(exc))
         except Exception as exc:
+            record_exception("media-content", "desktop.handled", exc)
             self.failed.emit(
                 "unexpected_error",
                 f"分析没有完成（{type(exc).__name__}）。请检查媒体文件和本地模型。",
@@ -216,8 +220,10 @@ class CopyWorker(QThread):
                 )
             )
         except AnalyzerError as exc:
+            record_exception("media-content", "desktop.handled", exc)
             self.failed.emit(str(exc.code), str(exc))
         except Exception as exc:
+            record_exception("media-content", "desktop.handled", exc)
             self.failed.emit(
                 "unexpected_error",
                 f"文案没有生成（{type(exc).__name__}）。请确认 Ollama 和 qwen3.5:9b 正在运行。",
@@ -1006,6 +1012,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; backgr
 
 
 def main() -> None:
+    install_exception_hooks("media-content")
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--state-root")
     parser.add_argument("--diagnose-media")
@@ -1092,6 +1099,7 @@ def _run_headless_diagnostic(arguments: argparse.Namespace) -> None:
             )
             payload["copy_result"] = copy_result.model_dump(mode="json")
     except Exception as exc:
+        record_exception("media-content", "desktop.handled", exc)
         payload = {
             "ok": False,
             "error_type": type(exc).__name__,

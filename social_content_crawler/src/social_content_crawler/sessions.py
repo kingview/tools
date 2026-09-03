@@ -76,6 +76,7 @@ class BrowserDownloadSession:
 
     cookiefile: Path
     proxy_url: str | None
+    cdp_endpoint: str | None = None
 
 
 class BitBrowserClient:
@@ -134,6 +135,7 @@ class BitBrowserClient:
         return [item for item in raw if isinstance(item, dict)]
 
     def open_profile(self, profile_id: str) -> str:
+        from .browser_lifecycle import record_profile
         if not profile_id.strip():
             raise CrawlerError(ErrorCode.INVALID_REQUEST, "请选择一个比特浏览器 Profile。")
         profile_id = profile_id.strip()
@@ -143,6 +145,7 @@ class BitBrowserClient:
         # unnecessary in the common case.
         existing_endpoint = self._running_profile_endpoint(profile_id)
         if existing_endpoint:
+            record_profile(self, profile_id, existing_endpoint, opened=False)
             return existing_endpoint
 
         data = self._post(
@@ -159,12 +162,22 @@ class BitBrowserClient:
             http_endpoint = str(data.get("http") or "").strip()
             if http_endpoint:
                 endpoint = http_endpoint if "://" in http_endpoint else f"http://{http_endpoint}"
-        return validate_loopback_cdp_endpoint(endpoint)
+        endpoint = validate_loopback_cdp_endpoint(endpoint)
+        record_profile(self, profile_id, endpoint, opened=getattr(self, "_definitely_closed", False))
+        return endpoint
+
+    def close_profile(self, profile_id: str) -> None:
+        """Close the running window, never delete the saved profile or cookies."""
+        if not profile_id.strip():
+            raise CrawlerError(ErrorCode.INVALID_REQUEST, "缺少比特浏览器 Profile ID。")
+        self._post("/browser/close", {"id": profile_id.strip()})
 
     def _running_profile_endpoint(self, profile_id: str) -> str | None:
         """Return an active profile's local CDP endpoint without reopening it."""
+        self._definitely_closed = False
         try:
             alive = self._post("/browser/pids/alive", {"ids": [profile_id]})
+            self._definitely_closed = isinstance(alive, dict) and not alive.get(profile_id)
             if not isinstance(alive, dict) or not alive.get(profile_id):
                 return None
             ports = self._post("/browser/ports", {})
@@ -371,14 +384,14 @@ class SessionRegistry:
         client = self._client_factory(record.api_url)
         # Opening the Profile first makes BitBrowser apply its configured proxy
         # and keeps browser navigation and media download on the same route.
-        client.open_profile(record.profile_id)
+        cdp_endpoint = client.open_profile(record.profile_id)
         detail = client.profile_detail(record.profile_id)
         cookies = _profile_platform_cookies(client, record.profile_id, platform)
         proxy_url = _proxy_url_from_profile_detail(detail)
         cookiefile = working_directory / f".postdrop-session-{secrets.token_hex(8)}.cookies.txt"
         try:
             _write_cookiejar(cookiefile, cookies)
-            yield BrowserDownloadSession(cookiefile=cookiefile, proxy_url=proxy_url)
+            yield BrowserDownloadSession(cookiefile=cookiefile, proxy_url=proxy_url, cdp_endpoint=cdp_endpoint)
         finally:
             cookiefile.unlink(missing_ok=True)
 

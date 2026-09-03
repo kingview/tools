@@ -69,7 +69,7 @@ def test_download_normalizes_artifact_and_audits(tmp_path: Path) -> None:
     assert Path(result.artifacts[0].path).is_relative_to(tmp_path)
     assert result.network_route == "direct"
     assert audit.events[0].event_type == "tool.succeeded"
-    assert audit.events[0].tool_version == "1.9.0"
+    assert audit.events[0].tool_version == "1.9.2"
 
 
 def test_metadata_only_is_dry_run(tmp_path: Path) -> None:

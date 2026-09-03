@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 import json
@@ -29,7 +31,7 @@ from .ports import AuditSink, DownloaderBackend, RateLimiter, ToolContext, UrlPo
 
 TOOL_SPEC = ToolSpec(
     name="social.download_media",
-    version="1.9.0",
+    version="1.9.2",
     description=(
         "Extract metadata or download social-media media; registered BitBrowser "
         "sessions use the Profile's proxy route as well as its platform cookies."
@@ -76,6 +78,7 @@ class SocialMediaDownloadTool:
     def spec(self) -> ToolSpec:
         return TOOL_SPEC
 
+    @logged("social-content", "social.download_media")
     async def execute(self, request: DownloadInput, context: ToolContext) -> DownloadOutput:
         input_hash = _hash_model(request)
         output: DownloadOutput | None = None

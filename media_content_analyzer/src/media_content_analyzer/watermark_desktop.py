@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import install_exception_hooks, record_exception
+
 import argparse
 import asyncio
 import hashlib
@@ -270,8 +272,10 @@ class WatermarkWorker(QThread):
                 )
             )
         except AnalyzerError as exc:
+            record_exception("media-content", "watermark_desktop.handled", exc)
             self.failed.emit(str(exc.code), str(exc))
         except Exception as exc:
+            record_exception("media-content", "watermark_desktop.handled", exc)
             self.failed.emit(
                 "unexpected_error",
                 f"任务没有完成（{type(exc).__name__}）。请检查视频格式和 FFmpeg。",
@@ -1033,6 +1037,7 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; backgr
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    install_exception_hooks("media-content")
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--state-root")
     parser.add_argument("--output-root")
@@ -1102,6 +1107,7 @@ def _run_headless_diagnostic(arguments: argparse.Namespace) -> None:
         )
         payload: dict[str, object] = {"ok": True, "result": output.model_dump(mode="json")}
     except Exception as exc:
+        record_exception("media-content", "watermark_desktop.handled", exc)
         payload = {
             "ok": False,
             "error_type": type(exc).__name__,

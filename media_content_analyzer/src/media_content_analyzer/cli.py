@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import install_exception_hooks, record_exception
+
 import argparse
 import asyncio
 import hashlib
@@ -54,10 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    install_exception_hooks("media-content")
     args = build_parser().parse_args(argv)
     try:
         return asyncio.run(_run(args))
     except (AnalyzerError, ValueError) as exc:
+        record_exception("media-content", "cli.handled", exc)
         code = getattr(exc, "code", "invalid_input")
         print(f"ERROR [{code}]: {exc}", file=sys.stderr)
         return 2

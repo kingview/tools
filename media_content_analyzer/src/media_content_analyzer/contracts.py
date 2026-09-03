@@ -158,13 +158,17 @@ class TagNamespace(StrEnum):
     SAFETY = "safety"
 
 
+TAG_LABEL_MAX_LENGTH = 200
+TAG_EVIDENCE_MAX_ITEMS = 50
+
+
 class Tag(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     namespace: TagNamespace
-    label: str = Field(min_length=1, max_length=200)
+    label: str = Field(min_length=1, max_length=TAG_LABEL_MAX_LENGTH)
     confidence: float = Field(ge=0, le=1)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=50)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=TAG_EVIDENCE_MAX_ITEMS)
 
 
 class Evidence(BaseModel):

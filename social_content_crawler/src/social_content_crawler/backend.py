@@ -21,6 +21,8 @@ from yt_dlp.networking import Request as YtDlpRequest
 
 from .contracts import BrowserCookieSource, DownloadInput, DownloadMode, MediaFormat
 from .errors import CrawlerError, ErrorCode
+from .diagnostics import record_exception
+from .douyin_browser import extract_from_browser
 from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR, ProfileTaskCoordinator
 from .sessions import SessionRegistry, TELEGRAM_PLATFORM
 from .telegram_web import TelegramWebDownloader
@@ -132,6 +134,7 @@ class YtDlpBackend:
                     output_directory,
                     session.cookiefile if session is not None else None,
                     session.proxy_url if session is not None else None,
+                    getattr(session, "cdp_endpoint", None),
                 )
 
     def _run(
@@ -140,6 +143,7 @@ class YtDlpBackend:
         output_directory: Path,
         session_cookiefile: Path | None,
         session_proxy_url: str | None,
+        session_cdp_endpoint: str | None = None,
     ) -> list[dict[str, Any]]:
         download_post_images = _supports_image_posts(request)
         ffmpeg_executable = _ffmpeg_executable()
@@ -188,6 +192,7 @@ class YtDlpBackend:
                 if len(collected) >= request.max_items:
                     break
                 extractor_url = normalize_extractor_url(str(source_url))
+                douyin_fallback = False
                 try:
                     info, downloader = self._extract_with_browser_fallback(
                         extractor_url,
@@ -204,6 +209,22 @@ class YtDlpBackend:
                         safe_info = downloader.sanitize_info(info) if info else None
                     elif not _is_douyin_url(extractor_url):
                         raise
+                    else:
+                        # Persist the original error BEFORE a fallback can replace
+                        # it; quiet yt-dlp logging must not hide the root failure.
+                        record_exception("social-content", "download.douyin.primary", exc)
+                        douyin_fallback = True
+                # Start fallback outside the exception handler. Its own failure
+                # must get a fresh diagnostic, not look like propagation of the
+                # already-logged primary error through implicit __context__.
+                if douyin_fallback:
+                    if request.session_ref:
+                        if not session_cdp_endpoint:
+                            raise CrawlerError(ErrorCode.CONFIGURATION_ERROR,
+                                "抖音登录会话缺少比特浏览器连接，未切换到匿名浏览器。")
+                        safe_info = self._douyin_browser_fallback(
+                            extractor_url, request, base_options, session_cdp_endpoint,
+                        )
                     else:
                         safe_info = _douyin_public_page_fallback(
                             str(source_url), request, output_directory, session_proxy_url
@@ -230,6 +251,36 @@ class YtDlpBackend:
             raise CrawlerError(code, message, retryable=False) from exc
         return collected
 
+    def _douyin_browser_fallback(self, page_url, request, base_options, cdp_endpoint):
+        info = extract_from_browser(cdp_endpoint=cdp_endpoint, page_url=page_url,
+                                    timeout=request.request_timeout_seconds)
+        options = dict(base_options)
+        images = not info.get("formats") and bool(info.get("thumbnails"))
+        expected_images = len(info.get("thumbnails", []))
+        if images:
+            if request.media_format is MediaFormat.AUDIO:
+                raise CrawlerError(ErrorCode.INVALID_REQUEST, "目标抖音帖子是图文，不能下载为音频。")
+            options.update(skip_download=True, ignore_no_formats_error=True, writethumbnail=True, write_all_thumbnails=True)
+        elif request.media_format is MediaFormat.AUDIO:
+            if not options.get("ffmpeg_location"):
+                raise CrawlerError(ErrorCode.CONFIGURATION_ERROR, "仅音频下载需要 FFmpeg。")
+            options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
+        # Same profile cookies/proxy and the same size/duration/format limits as
+        # the primary path. No anonymous or direct-network retry for a session.
+        with yt_dlp.YoutubeDL(options) as downloader:
+            result = downloader.process_ie_result(info, download=request.mode is DownloadMode.DOWNLOAD)
+            if not result:
+                raise DownloadError("Douyin browser media was rejected by the configured limits")
+            if request.mode is DownloadMode.DOWNLOAD:
+                if images:
+                    paths = [item.get("filepath") for item in result.get("thumbnails", [])]
+                    if len(paths) != expected_images or not all(p and Path(p).is_file() and Path(p).stat().st_size for p in paths):
+                        raise DownloadError("Douyin image download incomplete")
+                elif not any(Path(p).is_file() and Path(p).stat().st_size for p in
+                             [item.get("filepath", "") for item in result.get("requested_downloads", [])]):
+                    raise DownloadError("Douyin browser media download did not produce a file")
+            return downloader.sanitize_info(result)
+
     def _extract_with_browser_fallback(
         self,
         extractor_url: str,
@@ -249,6 +300,8 @@ class YtDlpBackend:
         last_error: DownloadError | None = None
         for index, browser in enumerate(candidates):
             options = dict(base_options)
+            if _is_xiaohongshu_url(extractor_url):
+                options["format"] = _xiaohongshu_format_selector()
             if browser == "__cache__":
                 options["cookiefile"] = str(self._cookie_cache_path)
             elif browser:
@@ -287,6 +340,18 @@ def _format_selector(media_format: MediaFormat, *, ffmpeg_available: bool) -> st
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         )
     return "best[ext=mp4]/best/bestvideo[ext=mp4]/bestvideo"
+
+
+def _xiaohongshu_format_selector() -> str:
+    """Prefer the same HEVC rendition used by the XiaoHongShu web player.
+
+    XiaoHongShu may expose an EF5/HEVC playback rendition and a larger
+    EF4/H.264 export rendition for the same note. Generic ``best`` sorting
+    prefers the latter by bitrate even when that copy has a baked watermark.
+    Keep a generic fallback for notes that do not publish EF5.
+    """
+
+    return "best[vcodec=EF5]/best[vcodec^=hvc]/best"
 
 
 def _ffmpeg_executable() -> str | None:
@@ -492,8 +557,11 @@ def _render_public_page(
 ) -> tuple[str, str, str | None]:
     timeout_ms = int(timeout * 1000)
     last_error: Exception | None = None
+    executables = _chromium_executables()
+    if not executables:
+        raise DownloadError("No supported local browser found; use a registered BitBrowser session_ref")
     with sync_playwright() as playwright:
-        for executable in _chromium_executables():
+        for executable in executables:
             browser = None
             try:
                 launch_options: dict[str, Any] = {
@@ -535,6 +603,13 @@ def _render_public_page(
 
 
 def _chromium_executables() -> list[Path]:
+    if sys.platform == "darwin":
+        return [path for base in (Path("/Applications"), Path.home() / "Applications")
+                for path in (base / "Google Chrome.app/Contents/MacOS/Google Chrome",
+                             base / "Microsoft Edge.app/Contents/MacOS/Microsoft Edge") if path.is_file()]
+    if sys.platform != "win32":
+        return [Path(path) for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge")
+                if (path := shutil.which(name))]
     program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
     program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
     local = Path(os.environ.get("LOCALAPPDATA", ""))

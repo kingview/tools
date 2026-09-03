@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import install_exception_hooks, record_exception
+
 import argparse
 import asyncio
 import os
@@ -10,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
-from PySide6.QtCore import QStandardPaths, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +24,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -97,8 +101,10 @@ class DownloadWorker(QThread):
                 )
             )
         except CrawlerError as exc:
+            record_exception("social-content", "desktop.handled", exc)
             self.failed.emit(str(exc.code), str(exc))
-        except Exception:
+        except Exception as exc:
+            record_exception("social-content", "gui.download", exc)
             self.failed.emit(
                 "unexpected_error",
                 "下载失败。请确认帖子公开可访问、地址正确，并检查网络连接。",
@@ -137,13 +143,152 @@ class DownloadWorker(QThread):
         self.progress_changed.emit(percent, message)
 
 
-class SessionManagerDialog(QDialog):
+class _ReadyDialog(QDialog):
+    """Acknowledge only the top-level plugin window once it is exposed."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("browserWindowDialog")
+        raw_ready_path = os.getenv("SOCIAL_AGENT_GUI_READY_FILE", "").strip()
+        self._ready_path = Path(raw_ready_path) if raw_ready_path and parent is None else None
+        self._ready_timer = QTimer(self)
+        self._ready_timer.setInterval(50)
+        self._ready_timer.timeout.connect(self._report_window_ready)
+
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().showEvent(event)
+        if self._ready_path is not None:
+            self._ready_timer.start()
+
+    def _report_window_ready(self) -> None:
+        handle = self.windowHandle()
+        if not self.isVisible() or handle is None or not handle.isExposed():
+            return
+        self._ready_timer.stop()
+        if self._ready_path is None:
+            return
+        try:
+            temporary = self._ready_path.with_suffix(".tmp")
+            temporary.write_text(str(os.getpid()), encoding="utf-8")
+            temporary.replace(self._ready_path)
+        except OSError as exc:
+            record_exception("social-content", "desktop.handled", exc)
+            print(f"Unable to acknowledge GUI readiness: {exc}", file=sys.stderr)
+        self._ready_path = None
+
+
+class RegisteredSessionsDialog(_ReadyDialog):
     sessions_changed = Signal()
 
     def __init__(self, registry: SessionRegistry, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._registry = registry
-        self.setWindowTitle("管理社媒登录会话")
+        self.setWindowTitle("管理浏览器窗口")
+        self.setMinimumWidth(680)
+        self.resize(760, 500)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        self.title_label = QLabel()
+        self.title_label.setObjectName("dialogTitle")
+        copy = QLabel("以下是已注册、可供 Agent 使用的浏览器窗口。移除引用不会删除比特浏览器窗口，也不会退出账号。")
+        copy.setObjectName("dialogCopy")
+        copy.setWordWrap(True)
+        layout.addWidget(self.title_label)
+        layout.addWidget(copy)
+
+        self.registered_list = QListWidget()
+        self.registered_list.setObjectName("registeredWindows")
+        self.registered_list.setMinimumHeight(240)
+        self.registered_list.setWordWrap(True)
+        self.registered_list.currentItemChanged.connect(self._update_remove_button)
+        layout.addWidget(self.registered_list, 1)
+        self.empty_label = QLabel("尚未注册浏览器窗口，点击‘注册新窗口’添加。")
+        self.empty_label.setObjectName("dialogCopy")
+        self.empty_label.setWordWrap(True)
+        layout.addWidget(self.empty_label)
+
+        self.register_new_button = QPushButton("注册新窗口")
+        self.register_new_button.setObjectName("primaryButton")
+        self.register_new_button.clicked.connect(self.register_new_window)
+        self.remove_button = QPushButton("移除引用")
+        self.remove_button.setObjectName("secondaryButton")
+        self.remove_button.clicked.connect(self.remove_session)
+        self._refresh_registered()
+
+        close_button = QPushButton("完成")
+        close_button.setObjectName("secondaryButton")
+        close_button.clicked.connect(self.accept)
+        for button in (self.register_new_button, self.remove_button, close_button):
+            button.setFixedHeight(48)
+        close_row = QHBoxLayout()
+        close_row.addWidget(self.register_new_button)
+        close_row.addWidget(self.remove_button)
+        close_row.addStretch()
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+    def remove_session(self) -> None:
+        item = self.registered_list.currentItem()
+        session_ref = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not session_ref:
+            return
+        try:
+            self._registry.revoke(str(session_ref))
+        except (CrawlerError, OSError) as exc:
+            record_exception("social-content", "desktop.handled", exc)
+            QMessageBox.warning(self, "无法移除引用", str(exc))
+            return
+        self._refresh_registered()
+        self.sessions_changed.emit()
+
+    def _refresh_registered(self, selected_ref: str | None = None) -> None:
+        current = self.registered_list.currentItem()
+        if selected_ref is None and current is not None:
+            selected_ref = current.data(Qt.ItemDataRole.UserRole)
+        self.registered_list.clear()
+        records = self._registry.list()
+        self.title_label.setText(f"已注册浏览器窗口（{len(records)}）")
+        self.empty_label.setVisible(not records)
+        for record in records:
+            suffix = record.session_ref[-8:]
+            platform_label = SESSION_PLATFORM_LABELS.get(record.platform, record.platform)
+            item = QListWidgetItem(f"{platform_label} · {record.profile_name} · …{suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, record.session_ref)
+            item.setToolTip(f"Profile: {record.profile_id}\nsession_ref: {record.session_ref}")
+            item.setSizeHint(QSize(0, 56))
+            self.registered_list.addItem(item)
+            if record.session_ref == selected_ref:
+                self.registered_list.setCurrentItem(item)
+        if records and self.registered_list.currentItem() is None:
+            self.registered_list.setCurrentRow(0)
+        self._update_remove_button()
+
+    def _update_remove_button(self) -> None:
+        self.remove_button.setEnabled(self.registered_list.currentItem() is not None)
+
+    def register_new_window(self) -> None:
+        dialog = SessionManagerDialog(self._registry, self)
+
+        def registered() -> None:
+            self._refresh_registered(dialog.session_ref_output.text() or None)
+            self.sessions_changed.emit()
+
+        dialog.sessions_changed.connect(registered)
+        dialog.exec()
+        self._refresh_registered(dialog.session_ref_output.text() or None)
+        dialog.deleteLater()
+
+
+class SessionManagerDialog(_ReadyDialog):
+    sessions_changed = Signal()
+
+    def __init__(self, registry: SessionRegistry, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._registry = registry
+        self._registered_selection: tuple[str, str, str] | None = None
+        self.setWindowTitle("注册新窗口")
         self.setMinimumWidth(590)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -190,7 +335,7 @@ class SessionManagerDialog(QDialog):
         self.profile_combo.setObjectName("optionControl")
         self.profile_combo.addItem("请先读取 Profile", None)
         self.register_button = QPushButton("生成 session_ref")
-        self.register_button.setObjectName("primaryButton")
+        self.register_button.setObjectName("secondaryButton")
         self.register_button.clicked.connect(self.register_profile)
         profile_row.addWidget(self.profile_combo, 1)
         profile_row.addWidget(self.register_button)
@@ -209,25 +354,22 @@ class SessionManagerDialog(QDialog):
         ref_row.addWidget(copy_button)
         layout.addLayout(ref_row)
 
-        layout.addWidget(_option_label("已注册会话"))
-        registered_row = QHBoxLayout()
-        self.registered_combo = QComboBox()
-        self.registered_combo.setObjectName("optionControl")
-        self.remove_button = QPushButton("移除引用")
-        self.remove_button.setObjectName("secondaryButton")
-        self.remove_button.clicked.connect(self.remove_session)
-        registered_row.addWidget(self.registered_combo, 1)
-        registered_row.addWidget(self.remove_button)
-        layout.addLayout(registered_row)
-        self._refresh_registered()
-
-        close_button = QPushButton("完成")
-        close_button.setObjectName("secondaryButton")
-        close_button.clicked.connect(self.accept)
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.setObjectName("secondaryButton")
+        self.cancel_button.setAutoDefault(False)
+        self.cancel_button.clicked.connect(self.reject)
+        self.finish_button = QPushButton("注册并完成")
+        self.finish_button.setObjectName("primaryButton")
+        self.finish_button.setDefault(True)
+        self.finish_button.clicked.connect(self.register_and_finish)
         close_row = QHBoxLayout()
         close_row.addStretch()
-        close_row.addWidget(close_button)
+        close_row.addWidget(self.cancel_button)
+        close_row.addWidget(self.finish_button)
         layout.addLayout(close_row)
+        self.platform_combo.currentIndexChanged.connect(self._invalidate_registration)
+        self.profile_combo.currentIndexChanged.connect(self._invalidate_registration)
+        self.api_url_input.textChanged.connect(self._invalidate_registration)
 
     def load_profiles(self) -> None:
         try:
@@ -235,6 +377,7 @@ class SessionManagerDialog(QDialog):
             client.health()
             profiles = client.list_profiles()
         except CrawlerError as exc:
+            record_exception("social-content", "desktop.handled", exc)
             QMessageBox.warning(self, "无法读取 Profile", str(exc))
             return
         self.profile_combo.clear()
@@ -244,7 +387,7 @@ class SessionManagerDialog(QDialog):
         for profile in profiles:
             self.profile_combo.addItem(f"{profile.name}  ·  {profile.profile_id}", profile.profile_id)
 
-    def register_profile(self) -> None:
+    def register_profile(self) -> bool:
         profile_id = self.profile_combo.currentData()
         platform = str(self.platform_combo.currentData())
         platform_label = SESSION_PLATFORM_LABELS[platform]
@@ -254,51 +397,44 @@ class SessionManagerDialog(QDialog):
                 "尚未选择 Profile",
                 f"请先读取并选择一个已登录 {platform_label} 的 Profile。",
             )
-            return
+            return False
+        selection = (platform, self.api_url_input.text().strip(), str(profile_id))
         try:
+            # An optional earlier "generate" click already registered this exact
+            # selection. Finishing must not rotate the reference a second time.
+            if self._registered_selection == selection and any(
+                item.session_ref == self.session_ref_output.text()
+                for item in self._registry.list()
+            ):
+                return True
             record = self._registry.register_bitbrowser(
                 platform,
-                self.api_url_input.text(),
+                selection[1],
                 str(profile_id),
             )
-        except CrawlerError as exc:
+        except (CrawlerError, OSError) as exc:
+            record_exception("social-content", "desktop.handled", exc)
             QMessageBox.warning(self, "注册没有完成", str(exc))
-            return
+            return False
         self.session_ref_output.setText(record.session_ref)
         self.session_ref_output.selectAll()
-        self._refresh_registered(record.session_ref)
+        self._registered_selection = selection
+        self.finish_button.setText("完成")
         self.sessions_changed.emit()
+        return True
+
+    def register_and_finish(self) -> None:
+        if self.register_profile():
+            self.accept()
+
+    def _invalidate_registration(self) -> None:
+        self._registered_selection = None
+        self.session_ref_output.clear()
+        self.finish_button.setText("注册并完成")
 
     def copy_session_ref(self) -> None:
         if self.session_ref_output.text():
             QApplication.clipboard().setText(self.session_ref_output.text())
-
-    def remove_session(self) -> None:
-        session_ref = self.registered_combo.currentData()
-        if not session_ref:
-            return
-        self._registry.revoke(str(session_ref))
-        self._refresh_registered()
-        self.sessions_changed.emit()
-
-    def _refresh_registered(self, selected_ref: str | None = None) -> None:
-        self.registered_combo.clear()
-        records = self._registry.list()
-        if not records:
-            self.registered_combo.addItem("尚未注册", None)
-            self.remove_button.setEnabled(False)
-            return
-        self.remove_button.setEnabled(True)
-        for record in records:
-            suffix = record.session_ref[-8:]
-            platform_label = SESSION_PLATFORM_LABELS.get(record.platform, record.platform)
-            self.registered_combo.addItem(
-                f"{platform_label} · {record.profile_name} · …{suffix}",
-                record.session_ref,
-            )
-            if record.session_ref == selected_ref:
-                self.registered_combo.setCurrentIndex(self.registered_combo.count() - 1)
-
 
 class MainWindow(QMainWindow):
     def __init__(
@@ -452,7 +588,7 @@ class MainWindow(QMainWindow):
         session_label_row = QHBoxLayout()
         session_label_row.addWidget(_option_label("平台登录会话（可选）"))
         session_label_row.addStretch()
-        self.manage_sessions_button = QPushButton("管理登录会话")
+        self.manage_sessions_button = QPushButton("管理浏览器窗口")
         self.manage_sessions_button.setObjectName("inlineButton")
         self.manage_sessions_button.clicked.connect(self.manage_sessions)
         session_label_row.addWidget(self.manage_sessions_button)
@@ -594,6 +730,7 @@ class MainWindow(QMainWindow):
                 telegram_max_messages=2_000,
             )
         except ValidationError as exc:
+            record_exception("social-content", "desktop.handled", exc)
             self._show_error(str(exc.errors()[0].get("msg", "帖子地址不正确")))
             return
 
@@ -675,7 +812,7 @@ class MainWindow(QMainWindow):
         self._last_output = None
 
     def manage_sessions(self) -> None:
-        dialog = SessionManagerDialog(self._session_registry, self)
+        dialog = RegisteredSessionsDialog(self._session_registry, self)
         dialog.sessions_changed.connect(self._refresh_sessions)
         dialog.exec()
         self._refresh_sessions()
@@ -851,6 +988,7 @@ def format_duration(seconds: float) -> str:
 
 
 STYLESHEET = """
+QDialog#browserWindowDialog { background: #15171d; color: #f5f6f8; }
 QWidget#root, QWidget#content { background: #0b0c10; color: #f5f6f8; }
 QScrollArea { background: #0b0c10; border: none; }
 QLabel#brandMark { min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; border-radius: 9px; background: #d8ff52; color: #0b0c10; font-size: 18px; font-weight: 900; qproperty-alignment: AlignCenter; }
@@ -887,6 +1025,10 @@ QPushButton#inlineButton { min-height: 26px; padding: 0 8px; border: none; backg
 QLineEdit#sessionInput { min-height: 38px; padding: 0 11px; border: 1px solid #30333c; border-radius: 9px; background: #101217; color: #d7d9de; }
 QLabel#dialogTitle { color: #f5f6f8; font-size: 18px; font-weight: 750; }
 QLabel#dialogCopy { color: #8d929d; font-size: 10px; }
+QListWidget#registeredWindows { background: #101217; color: #d7d9de; border: 1px solid #30333c; border-radius: 9px; padding: 6px; font-size: 13px; }
+QListWidget#registeredWindows::item { padding: 0 12px; border-radius: 6px; }
+QListWidget#registeredWindows::item:selected { background: #30363e; color: #d8ff52; }
+QListWidget#registeredWindows::item:hover { background: #292c34; }
 QLabel#extractor { color: #d8ff52; font-size: 9px; font-weight: 750; }
 QLabel#postTitle { color: #f1f2f4; font-size: 20px; font-weight: 730; }
 QLabel#postMeta { color: #727783; font-size: 10px; }
@@ -910,6 +1052,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
 
 
 def main() -> None:
+    install_exception_hooks("social-content")
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--output-root")
     parser.add_argument("--manage-sessions-only", action="store_true")
@@ -923,7 +1066,7 @@ def main() -> None:
     output_root = Path(arguments.output_root).expanduser() if arguments.output_root else None
     if arguments.manage_sessions_only:
         registry = SessionRegistry(default_session_registry_path())
-        dialog = SessionManagerDialog(registry)
+        dialog = RegisteredSessionsDialog(registry)
         dialog.exec()
         return
     window = MainWindow(output_root=output_root)

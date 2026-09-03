@@ -294,6 +294,41 @@ def test_normalizes_douyin_and_xiaohongshu_post_urls() -> None:
         "https://www.xiaohongshu.com/explore/abc123?xsec_token=redacted"
     )
 
+    xhs_search = normalize_rows(
+        BrowsePlatform.XIAOHONGSHU,
+        [
+            {
+                "url": (
+                    "https://www.xiaohongshu.com/search_result/abc123"
+                    "?xsec_token=from-card&xsec_source=pc_search&ignored=1"
+                )
+            }
+        ],
+        10,
+    )
+    assert str(xhs_search[0].url) == (
+        "https://www.xiaohongshu.com/explore/abc123"
+        "?xsec_token=from-card&xsec_source=pc_search"
+    )
+
+
+def test_xiaohongshu_dom_extractor_prefers_tokenized_detail_link() -> None:
+    class FakeLocator:
+        def evaluate_all(self, script):
+            assert "authenticatedLink" in script
+            assert "xsec_token" in script
+            assert "search_result" in script
+            return []
+
+    class FakePage:
+        def locator(self, selector):
+            assert "/explore/" in selector
+            return FakeLocator()
+
+    from social_content_crawler.browse_backend import _extract_xhs_rows
+
+    assert _extract_xhs_rows(FakePage()) == []
+
 
 def test_metric_parser_supports_compact_and_chinese_units() -> None:
     assert _metric_number("4.2K Likes") == 4_200

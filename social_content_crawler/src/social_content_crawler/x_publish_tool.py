@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 from datetime import UTC, datetime
@@ -60,6 +62,7 @@ class XPublishTool:
     def spec(self) -> ToolSpec:
         return X_PUBLISH_TOOL_SPEC
 
+    @logged("social-content", "social.publish_x_post")
     async def execute(self, request: XPublishInput, context: ToolContext) -> XPublishOutput:
         safe_input = request.model_dump(exclude={"approval_token"}, mode="json")
         input_hash = _hash(str(safe_input))
@@ -97,4 +100,3 @@ class XPublishTool:
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-

@@ -151,7 +151,8 @@ class TelegramWebDownloader:
                     if not page.is_closed()
                     and (urlsplit(page.url).hostname or "").lower() == "web.telegram.org"
                 ]
-                page = pages[-1] if pages else context.new_page()
+                from .browser_lifecycle import new_task_page
+                page = pages[-1] if pages else new_task_page(context, cdp_endpoint)
                 page.set_default_timeout(request.request_timeout_seconds * 1_000)
                 page.wait_for_timeout(500)
                 if request.telegram_scope is TelegramDownloadScope.CHANNEL:

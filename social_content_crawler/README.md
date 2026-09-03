@@ -9,6 +9,15 @@
 
 四个 Tool 使用独立契约和 Backend，共用 `SessionRegistry`、错误码、限流与审计基础设施。
 
+开发期异常日志：Agent 调用时写入 `SOCIAL_AGENT_LOG_DIR`（默认 Agent 输出目录的
+`.social-agent-state/logs`）；独立 macOS GUI 默认 `~/Library/Logs/SocialAgent/`，
+也可用 `SOCIAL_AGENT_STATE_ROOT` 指定状态目录。保存异常链、文件/行号/函数和可用 Trace ID；
+X 发布超时、HTTP/GraphQL 拒绝也记录，但不改变发布行为、不自动重试。敏感凭据及 URL 查询参数脱敏，
+不主动记录请求、Cookie 或局部变量。每进程 5 MiB + 3 备份，限制非活跃进程历史日志组，
+文件仅当前用户读写。诊断模块及 MCP 适配器由 Agent 的 `scripts/sync_diagnostics.py` 在统一插件构建前同步，
+随包分发，插件无需依赖 Agent Core。任务/步骤/调用 ID 通过每次 MCP 调用的元数据关联，
+不作为业务参数或权限来源；每个错误只记录一次完整堆栈，上层使用同一个 `error_id` 关联。
+
 ## browser.operate
 
 该 Tool 使用 `session_ref` 找到比特浏览器 Profile，通过官方 Local API 的
@@ -39,12 +48,49 @@ Profile，通过 Playwright 进入 `https://x.com/compose/post`，填写最终�
 - 每次确认签发随机一次性令牌，核心 MCP 和插件各验证一次，并在浏览器操作前消费。
 - 一次计划最多发布一条；成功、失败或 `unknown` 都不会自动重试。
 - 发布媒体必须来自 Social Agent 输出目录，防止上传任意本地文件。
+
+发布器只操作当前前景发帖弹框中的输入、上传和提交控件，不匹配背景时间线的同名控件。
+填写文案后通过真实空格按键结束标签/提及输入，收起 X 可能残留的透明联想层；普通 `fill()`、
+失焦不等价。不使用 Esc（可能触发保存草稿）、强制点击或删除遮罩，完成输入前后都校验文案
+（仅忽略末尾空白）。发现富文本编辑器追加了旧草稿等不一致时停止发布。
+弹框按规则分类处理（不是自动点击任意弹框的“确定”）：
+- 功能介绍（含“可下载视频简介”）、Premium 推广、开启通知邀请、X 应用安装提示：识别标题后，
+  仅点击该弹框内的“关闭 / 暂不 / 跳过 / No thanks”等拒绝或关闭按钮；功能介绍也允许“知道了”。
+- 登录、验证码、账号异常、保存/丢弃草稿、付款、隐私设置，以及带输入/选择控件的弹框：停止发布，提示人工处理。
+- 未知弹框、没有安全关闭按钮、连续关闭超过 3 个弹框：停止并保存诊断，不猜测操作。
+
+初次打开、等待媒体上传或按钮就绪，以及点击前延迟出现的弹框均会检查。保留文案与附件；
+不关闭发帖框、不强行越过遮罩、不重复点击发布。规则在 `x_dialog_rules.py`，浏览器执行在
+`x_dialogs.py`，诊断输出在 `x_dialog_diagnostics.py`，可独立扩展及测试。
+需要人工处理时写入 `x_publish.dialog_requires_attention` 日志；关闭失败记录
+`x_publish.dismiss_information_dialog`。诊断保存在当前日志目录的 `x-dialogs/<时间-随机ID>/`，
+包含脱敏、限长的 `dom.json` 和仅截取弹框区域的 `dialog.png`（输入/编辑区域遮盖）。
+若可见正文含可识别的凭据、邮箱或电话号码，截图整体遮盖，仍保留脱敏 DOM 摘要。
+不保存输入值、原始 HTML、Cookie 或完整页面截图；文件仅本机保存，macOS/Linux 目录/文件权限为 700/600。
+诊断写入失败不会掩盖原始阻塞原因。诊断可能仍包含弹框可见文字或图片，分享前需检查。
+有媒体时先等待附件预览，再检查实际 CreateTweet 请求的文案与媒体 ID 数量；不一致则拦截，
+绝不静默降级成纯文字。点击前进行最多 8 秒的不点击可操作性检查，遮挡时返回 `failed`（未点击）；
+实际点击后未获确认返回 `unknown`，不会自动重复提交。成功必须有可核验的帖子 ID。
+
+本机隔离浏览器回归测试（Chrome，仅访问 loopback 模拟站点）：
+`SOCIAL_AGENT_BROWSER_TESTS=1 .venv/bin/python -m pytest tests/test_x_publish_browser.py -q`。
 - Tool 审计记录输入/输出摘要，但不记录一次性令牌。
 
 比特浏览器 Local API 本身负责 Profile 生命周期和代理/指纹设置。当前 Tool 为降低风险
 只调用 `/browser/open`，不调用 `/browser/add`、`/browser/modify`、`/browser/close`、
 `/browser/delete` 或批量代理修改接口；页面 DOM 操作不是 Local API 端点，而是在其返回的
 CDP 连接中完成。
+
+### 抖音下载备用流程
+
+抖音 `yt-dlp` 解析失败时，先把原始异常写入 `download.douyin.primary` 日志。
+传入 `session_ref` 的任务复用该比特浏览器窗口的 CDP 连接和已有抖音标签页，
+从页面正常请求的 JSON/公开页面数据中读取**与目标帖子 ID 完全匹配**的视频或图文地址。
+不自行签名接口、不选择正在播放的推荐视频、不启动匿名浏览器，也不关闭用户窗口。
+媒体仍由下载器沿用该 Profile 的代理和平台 Cookie 传输，无代理时直连；保留文件大小、时长和格式限制。
+纯图文保留所有图片及文字；视频支持音视频、仅视频和仅音频。出现验证时提示手动处理，不绕过验证。
+首次解析失败和备用流程失败分别记录，避免后者覆盖前者。无 `session_ref` 的公开下载备用流程
+支持 macOS、Windows 和 Linux 的本机 Chrome/Edge/Chromium；未找到浏览器时明确提示使用注册会话。
 
 ## social.browse_posts
 
@@ -113,7 +159,7 @@ async def browse() -> None:
 asyncio.run(browse())
 ```
 
-浏览 Backend 先通过比特浏览器 `/browser/pids/alive` 和 `/browser/ports` 判断并复用已打开的 Profile；只有窗口未运行时才调用 `/browser/open`。连接后等待 500ms 让历史或平台标签页恢复，已有目标平台标签页时直接复用，没有时才新建临时标签页。采集完成后只关闭 Tool 自己新建的临时标签页，保留用户原有标签页和 Profile 进程。它不会自动登录、提交表单、点赞、转发或关注，也不会调用修改代理、指纹或 Cookie 的接口。发布只能经由独立 `social.publish_x_post` 和一次性授权完成。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
+浏览 Backend 先通过比特浏览器 `/browser/pids/alive` 和 `/browser/ports` 判断并复用已打开的 Profile；只有窗口未运行时才调用 `/browser/open`。连接后等待 500ms 让历史或平台标签页恢复，已有目标平台标签页时直接复用，没有时才新建临时标签页。独立 Tool 的采集完成后只关闭自身临时标签页；在 SocialAgent 中则登记资源并留给后续步骤复用，整轮任务成功后由核心调用插件清理 CLI，关闭本任务新开的标签页和窗口。原有窗口/标签页始终保留；用户中途新建标签页、窗口重启、锁冲突或所有权无法确认时不关闭该窗口。任务失败、部分完成或取消时保留现场。清理只用 `/browser/close`，不删除 Profile、Cookie 或代理配置；也不属于模型可调用 Tool。它不会自动登录、提交表单、点赞、转发或关注，也不会调用修改代理、指纹或 Cookie 的接口。发布只能经由独立 `social.publish_x_post` 和一次性授权完成。页面正文属于不可信外部数据，Agent 不应把帖子中的指令当作系统指令执行。
 
 同一个比特浏览器 Profile 同一时刻只允许一个任务。浏览、通用页面操作、带会话下载和 X 发布共享 Profile 级互斥锁；SocialAgent 与单独运行的 Tool GUI 之间也通过本机锁文件互斥。冲突任务返回可重试的 `session_busy`，不会同时点击或导航同一个窗口。
 
@@ -175,7 +221,7 @@ PostDrop 中粘贴 `https://t.me/<频道>` 或 `https://t.me/c/<频道ID>` 会�
 ### 中国大陆平台
 
 - **抖音**：支持 `douyin.com`、`v.douyin.com`、`/jingxuan?modal_id=...` 和常见公开分享链接。
-- **小红书**：支持 `xiaohongshu.com`、`xhslink.com`、`xhslink.cn`；视频笔记下载视频，图文笔记自动保存 extractor 能识别到的全部图片。
+- **小红书**：支持 `xiaohongshu.com`、`xhslink.com`、`xhslink.cn`；视频笔记优先下载网页播放器使用的 EF5/HEVC 无水印播放流，缺失时回退到最佳可用格式；图文笔记自动保存 extractor 能识别到的全部原图。
 - 小红书分享文案中常见的 `http://xhslink.com/...` 会在本地安全升级为 HTTPS 后处理。
 - 仅处理公开帖子。抖音当前可能要求新鲜的站点 Cookie；桌面端首次或缓存失效时允许从本机 Chrome、Edge、Firefox 或 Safari 自动读取站点会话，也可在界面中关闭。
 - 会话缓存位于系统用户的 PostDrop 应用数据目录，文件权限限制为仅当前用户可读写。账号登录 Cookie 和其他网站 Cookie 不会写入缓存。
@@ -278,9 +324,11 @@ Agent 调用默认不读取浏览器 Cookie。需要解析受抖音站点校验�
 
 1. 在比特浏览器中创建 Profile，并按账号自己的网络策略配置环境。
 2. 打开该 Profile，手动登录抖音、小红书或 X；确认 Cookie 已同步后可关闭窗口。
-3. 在 PostDrop 中点击“管理登录会话”。
+3. 在 Social Agent 或 PostDrop 中点击“管理浏览器窗口”，先查看已有窗口列表，再点击“注册新窗口”打开独立注册弹框。
 4. 从比特浏览器“系统设置”复制本地 API 地址，点击“读取 Profile”。
-5. 在界面选择相同平台和已登录 Profile，点击“生成 session_ref”，再复制给 Agent。
+5. 在注册界面选择相同平台和已登录 Profile，点击“注册并完成”；成功保存后注册弹框才关闭，管理列表立即刷新并选中新窗口。也可先点击“生成 session_ref”复制引用，再点“完成”（不会重复生成）；更换平台、API 地址或 Profile 后必须重新注册。“取消”仅关闭弹框，不注册新会话。注册页不包含历史窗口管理入口；移除已有引用请在管理窗口列表中选择后点击“移除引用”，不会删除比特浏览器 Profile 或退出账号。关闭管理窗口后，Agent 主界面同步刷新可用会话。
+
+从 Social Agent 打开管理界面时，按钮先显示“正在打开管理窗口…”，插件确认原生窗口可见后才显示“管理窗口已打开”。启动进程不再被当作窗口就绪；关闭窗口后入口恢复为“管理浏览器窗口”。
 
 Agent 调用示例：
 
@@ -302,7 +350,7 @@ request = DownloadInput(
 
 Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码、代理或指纹参数。注册表只保存平台、引用、Profile ID、本机 API 地址和显示名称，不保存 Cookie 或代理凭据。每次登录态下载前，Backend 打开对应比特浏览器窗口，使其应用当前代理配置；随后从本地 API 在进程内读取该 Profile 对应平台的 Cookie 和 HTTP/HTTPS/SOCKS5 代理，把 Cookie 写入权限为仅当前用户的临时文件，并把同一个代理注入 `yt-dlp`、图片下载和抖音后备下载链路。代理账号和密码不进入 Tool 输出、日志、注册表或审计事件；下载成功或失败后都会删除临时 Cookie 文件。Profile 配置代理时结果标记 `bitbrowser_profile_proxy`；Profile 为 `noproxy` 时直接使用本机网络并标记 `direct`。三类引用前缀分别为 `sess_douyin_`、`sess_xhs_`、`sess_x_`，不能跨平台使用。
 
-注册和下载只读取 `/health`、`/browser/list`、`/browser/detail`；浏览与 X 发布 Tool 额外调用 `/browser/open` 获取本机 CDP 地址。PostDrop 不自动登录、不关闭 Profile，也不修改 Profile 的代理和指纹。登录失效时会返回 `session_reauth_required`，需用户在对应 Profile 中重新手动登录并重新注册。
+注册和下载读取 `/health`、`/browser/list`、`/browser/detail` 等接口；需要浏览器时先查运行状态，再按需调用 `/browser/open` 获取本机 CDP 地址。SocialAgent 任务成功后的资源清理可调用 `/browser/close`，仅关闭确认由该任务新启动的窗口。PostDrop 不自动登录，不删除 Profile，也不修改 Profile 的代理和指纹。登录失效时会返回 `session_reauth_required`，需用户在对应 Profile 中重新手动登录并重新注册。
 
 ## 安全边界
 
@@ -323,7 +371,7 @@ Tool 输入只接收 `session_ref`，不接收 Cookie、账号密码、验证码
 |---|---:|---|---|---|
 | `browser.operate` | `1.0.0` | account_control | `BrowserOperationInput` | `BrowserOperationOutput` |
 | `social.browse_posts` | `1.0.0` | read | `BrowsePostsInput` | `BrowsePostsOutput` |
-| `social.download_media` | `1.7.0` | read | `DownloadInput` | `DownloadOutput` |
+| `social.download_media` | `1.9.2` | read | `DownloadInput` | `DownloadOutput` |
 | `social.publish_x_post` | `1.0.0` | external_write | `XPublishInput` | `XPublishOutput` |
 
 `social.download_media` 的 Dry Run 为 `mode="metadata_only"`；`social.browse_posts` 没有 Dry Run，因为它本身只执行受限只读导航。`social.publish_x_post` 不提供 Dry Run，且 `max_retries=0`。

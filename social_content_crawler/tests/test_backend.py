@@ -15,6 +15,7 @@ from social_content_crawler.backend import (
     _download_filter,
     _download_error_message,
     _format_selector,
+    _xiaohongshu_format_selector,
     _strip_audio_tracks,
     normalize_extractor_url,
 )
@@ -246,6 +247,14 @@ def test_xiaohongshu_enables_image_post_download(monkeypatch, tmp_path: Path) ->
     assert captured["writethumbnail"] is True
     assert captured["write_all_thumbnails"] is True
     assert captured["ignore_no_formats_error"] is True
+    assert captured["format"] == _xiaohongshu_format_selector()
+
+
+def test_xiaohongshu_prefers_web_playback_hevc_before_generic_best() -> None:
+    selector = _xiaohongshu_format_selector()
+
+    assert selector.startswith("best[vcodec=EF5]")
+    assert selector.endswith("/best")
 
 
 def test_xiaohongshu_cn_shortlink_enables_image_post_download(monkeypatch, tmp_path: Path) -> None:

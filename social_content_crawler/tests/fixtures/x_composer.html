@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Offline X composer regression fixture</title>
+<style>
+body { font: 20px sans-serif; background:#ddd; }
+[role=dialog] { position:fixed; z-index:10; inset:60px 100px; background:white; padding:30px; }
+#backdrop { position:fixed; z-index:5; inset:0; background:#8888; }
+[contenteditable] { min-height:80px; border:1px solid #888; }
+img { width:60px; height:60px; }
+#blocker { display:none; position:fixed; z-index:100; inset:0; }
+#typeahead-backdrop { display:none; position:fixed; z-index:90; inset:0; background:transparent; }
+#intro-layer { display:none; position:fixed; z-index:95; inset:0; background:#0008; }
+#intro-layer [role=dialog] { inset:120px 130px; background:#222; color:white; }
+</style>
+<div id="background">
+  <div data-testid="tweetTextarea_0" role="textbox" contenteditable="true"></div>
+  <input type="file" data-testid="fileInput" accept="image/*,video/*" multiple>
+  <button data-testid="tweetButton" onclick="window.backgroundClicks++">Background Post</button>
+</div>
+<div id="backdrop"></div>
+<div role="dialog">
+  <h2>Foreground composer</h2>
+  <div data-testid="tweetTextarea_0" role="textbox" contenteditable="true"></div>
+  <input type="file" data-testid="fileInput" accept="image/*,video/*" multiple>
+  <div data-testid="attachments"></div>
+  <button data-testid="tweetButton" id="send">发帖</button>
+</div>
+<div id="typeahead-backdrop"></div>
+<div id="intro-layer">
+  <div role="dialog">
+    <button data-testid="app-bar-close" aria-label="关闭" onclick="dismissIntro()">×</button>
+    <div id="intro-title">可下载视频简介</div>
+    <p>Premium 用户现在可以下载你的内容并对其进行再创作。</p>
+    <button id="intro-ack" onclick="dismissIntro()">知道了</button>
+  </div>
+</div>
+<div id="blocker"></div>
+<script>
+window.introCloses=0;
+window.introOnUpload=false;
+window.showIntro=()=>document.querySelector('#intro-layer').style.display='block';
+window.dismissIntro=()=> {
+  window.introCloses++;
+  document.querySelector('#intro-layer').style.display='none';
+};
+window.backgroundClicks=0;
+window.foregroundClicks=0;
+window.dropMedia=false;
+window.simulateTypeahead=false;
+window.editorEscapes=0;
+window.spaceKeys=0;
+const dialog=document.querySelector('[role=dialog]');
+const editor=dialog.querySelector('[contenteditable]');
+editor.setAttribute('aria-controls','typeaheadDropdownWrapped-fixture');
+editor.addEventListener('input',()=> {
+  if(window.simulateTypeahead) document.querySelector('#typeahead-backdrop').style.display='block';
+});
+editor.addEventListener('keyup',event=> {
+  // Match X's keyboard completion behavior, including a backdrop that stays
+  // mounted after programmatic fill/blur even without visible suggestions.
+  if(event.key===' ') {
+    window.spaceKeys++;
+    document.querySelector('#typeahead-backdrop').style.display='none';
+  }
+  if(event.key==='Escape') window.editorEscapes++;
+});
+const files=dialog.querySelector('input');
+files.onchange=()=> {
+  dialog.querySelector('[data-testid=attachments]').replaceChildren(...Array.from(files.files).map(file=> {
+    const image=document.createElement('img'); image.src=URL.createObjectURL(file); return image;
+  }));
+  if(window.introOnUpload) window.showIntro();
+};
+document.querySelector('#send').onclick=()=> {
+  window.foregroundClicks++;
+  fetch('/i/api/graphql/offline/CreateTweet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({variables:{
+    tweet_text:dialog.querySelector('[contenteditable]').innerText,
+    media:{media_entities:window.dropMedia?[]:Array.from(files.files).map((_,i)=>({media_id:String(100+i)}))}
+  }})}).catch(()=>{});
+};
+</script>

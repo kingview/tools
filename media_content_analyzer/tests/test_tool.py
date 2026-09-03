@@ -135,6 +135,40 @@ def test_tool_does_not_cache_transient_semantic_model_fallback(tmp_path: Path) -
     assert backend.calls == 2
 
 
+def test_output_validation_error_reports_field_without_sensitive_model_values(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("SOCIAL_AGENT_LOG_DIR", str(tmp_path / "logs"))
+    from media_content_analyzer.contracts import Tag
+
+    class InvalidBackend(FakeBackend):
+        def analyze(self, *args):
+            Tag(namespace="topic", label="example", confidence=0.8,
+                evidence_refs=["private-model-content-or-token"] * 51)
+
+    image = tmp_path / "post.jpg"
+    image.write_bytes(b"image-content")
+    tool = MediaContentAnalyzerTool(backend=InvalidBackend(), audit_sink=InMemoryAuditSink(),
+        cache=InMemoryAnalysisCache(), allowed_media_root=tmp_path, work_root=tmp_path / "work")
+    with pytest.raises(AnalyzerError) as caught:
+        asyncio.run(tool.execute(AnalyzeContentInput(artifacts=[_manifest(image)]), _context()))
+    assert caught.value.code == ErrorCode.ANALYSIS_FAILED
+    assert "ValidationError: evidence_refs: too_long" in str(caught.value)
+    assert "private-model-content-or-token" not in str(caught.value)
+    logs = list((tmp_path / "logs").glob("media-content-*.jsonl"))
+    content = logs[0].read_text()
+    assert "private-model-content-or-token" not in content
+    record = json.loads(content.splitlines()[-1])
+    assert record["context"]["trace_id"] == "trace-1"
+    assert record["exception"]["cause"]["validation_errors"][0] == {"field": ["evidence_refs"], "type": "too_long"}
+    assert record["exception"]["cause"]["stack"]
+
+
+def test_unexpected_error_detail_does_not_expose_exception_body():
+    from media_content_analyzer.tool import _safe_error_details
+
+    assert _safe_error_details(RuntimeError("Authorization: Bearer secret")) == "RuntimeError"
+
+
 def test_tool_rejects_file_outside_media_root(tmp_path: Path) -> None:
     media_root = tmp_path / "media"
     media_root.mkdir()

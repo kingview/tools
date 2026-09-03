@@ -36,6 +36,37 @@ def test_contract_requires_x_session_and_non_blank_text() -> None:
         _request(text="   ")
 
 
+def test_submit_timeout_logs_original_error_without_repeating_click(tmp_path, monkeypatch):
+    import json
+    from social_content_crawler import x_publish
+    monkeypatch.setenv("SOCIAL_AGENT_LOG_DIR", str(tmp_path / "logs"))
+    clicks = []
+
+    ticks = iter([0, 31])
+    monkeypatch.setattr(x_publish.time, "monotonic", lambda: next(ticks))
+    page = SimpleNamespace(route=lambda *a: None, on=lambda *a: None,
+                           remove_listener=lambda *a: None, unroute=lambda *a: None)
+    button = SimpleNamespace(click=lambda **kw: clicks.append("trial" if kw.get("trial") else "clicked"))
+    result = x_publish._submit_once(page, button, request=_request(), media_count=0)
+    assert result.state == "unknown"
+    assert clicks == ["trial", "clicked"]
+    content = next((tmp_path / "logs").glob("*.jsonl")).read_text()
+    record = json.loads(content.splitlines()[0])
+    assert record["stage"] == "x_publish.confirmation_timeout"
+    assert record["exception"]["stack"]
+    assert TOKEN not in content and SESSION_REF not in content
+
+
+def test_confirmation_does_not_mistake_author_or_quoted_id_for_post():
+    from social_content_crawler.x_publish import _post_id_from_payload
+    payload={'data':{'create_tweet':{'tweet_results':{'result':{
+        'core':{'user_results':{'result':{'legacy':{'id_str':'999'}}}},
+        'quoted_status_result':{'result':{'rest_id':'888','__typename':'Tweet'}}}}}}}
+    assert _post_id_from_payload(payload) is None
+    payload['data']['create_tweet']['tweet_results']['result']['rest_id']='123'
+    assert _post_id_from_payload(payload)=='123'
+
+
 def test_backend_uses_x_profile_and_consumes_approval_once(tmp_path) -> None:
     media = tmp_path / "output" / "clip.mp4"
     media.parent.mkdir()
@@ -147,4 +178,3 @@ def test_publish_tool_is_critical_non_retrying_and_audited() -> None:
     assert X_PUBLISH_TOOL_SPEC.risk_level == "critical"
     assert X_PUBLISH_TOOL_SPEC.max_retries == 0
     assert audit.events[0].tool_name == "social.publish_x_post"
-

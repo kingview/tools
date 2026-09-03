@@ -26,7 +26,9 @@ from .telegram_web import resolve_telegram_web_url
 
 _X_POST_PATH = re.compile(r"^/([A-Za-z0-9_]{1,15})/status/(\d+)")
 _DOUYIN_POST_PATH = re.compile(r"^/(?:video|note)/(\d+)")
-_XHS_POST_PATH = re.compile(r"^/(?:explore|discovery/item)/([A-Za-z0-9]+)")
+_XHS_POST_PATH = re.compile(
+    r"^/(?:explore|discovery/item|search_result)/([A-Za-z0-9]+)"
+)
 _TELEGRAM_PUBLIC_POST_PATH = re.compile(r"^/([A-Za-z0-9_]{4,})/(\d+)")
 _TELEGRAM_PRIVATE_POST_PATH = re.compile(r"^/c/(\d+)/(\d+)")
 _NUMBER = re.compile(r"([0-9]+(?:[.,][0-9]+)?)\s*([KMB万亿]?)", re.IGNORECASE)
@@ -102,7 +104,8 @@ class PlaywrightCdpAutomation:
                 page = _existing_platform_page(context.pages, request.platform)
                 created_page = page is None
                 if page is None:
-                    page = context.new_page()
+                    from .browser_lifecycle import new_task_page
+                    page = new_task_page(context, cdp_endpoint)
                 page.set_default_timeout(request.navigation_timeout_seconds * 1_000)
                 try:
                     if request.platform is BrowsePlatform.TELEGRAM:
@@ -162,7 +165,8 @@ class PlaywrightCdpAutomation:
                             wait_timeout_ms=challenge_wait_ms,
                         )
                 finally:
-                    if created_page and not page.is_closed():
+                    from .browser_lifecycle import task_manages_pages
+                    if created_page and not task_manages_pages() and not page.is_closed():
                         page.close()
             except CrawlerError:
                 raise
@@ -490,10 +494,28 @@ def _extract_douyin_rows(page: Page) -> list[dict[str, Any]]:
 def _extract_xhs_rows(page: Page) -> list[dict[str, Any]]:
     return page.locator(_POST_SELECTORS[BrowsePlatform.XIAOHONGSHU]).evaluate_all(
         r"""
-        (links) => links.map((link) => {
-          const href = link.getAttribute('href') || '';
+        (links) => {
+        const seen = new Set();
+        return links.map((link) => {
+          const rawHref = link.getAttribute('href') || '';
+          const rawPath = new URL(rawHref, location.origin).pathname;
+          const postId = rawPath.match(/^\/(?:explore|discovery\/item)\/([A-Za-z0-9]+)/)?.[1];
+          const container = link.parentElement;
+          const authenticatedLink = postId ? [...(container?.querySelectorAll('a[href]') || [])]
+            .find((candidate) => {
+              const candidateUrl = new URL(candidate.getAttribute('href') || '', location.origin);
+              return candidateUrl.pathname.match(
+                new RegExp(`^/(?:explore|discovery/item|search_result)/${postId}$`)
+              ) && candidateUrl.searchParams.has('xsec_token');
+            }) : null;
+          const detailLink = authenticatedLink || link;
+          const href = detailLink.getAttribute('href') || rawHref;
           const path = new URL(href, location.origin).pathname;
-          if (!/^\/(explore|discovery\/item)\/[A-Za-z0-9]+/.test(path)) return null;
+          const identity = path.match(
+            /^\/(?:explore|discovery\/item|search_result)\/([A-Za-z0-9]+)/
+          )?.[1];
+          if (!identity || seen.has(identity)) return null;
+          seen.add(identity);
           const card = link.closest('section, article, li, [class*="note-item"]') || link.parentElement;
           const authorLink = card?.querySelector('a[href*="/user/profile/"]');
           const titleNode = card?.querySelector('[class*="title"], .title, h1, h2, h3');
@@ -507,7 +529,8 @@ def _extract_xhs_rows(page: Page) -> list[dict[str, Any]]:
             has_image: Boolean(card?.querySelector('img')),
             has_video: Boolean(card?.querySelector('video, [class*="video"]')),
           };
-        }).filter(Boolean)
+        }).filter(Boolean);
+        }
         """
     )
 

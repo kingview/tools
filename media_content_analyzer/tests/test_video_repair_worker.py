@@ -12,6 +12,7 @@ from media_content_analyzer.video_repair_worker import (
     ProgressReporter,
     _format_duration,
     _letterbox,
+    _solid_tracked_mask,
     _unletterbox,
     resolve_model_path,
     select_providers,
@@ -85,6 +86,13 @@ def test_lama_inpainter_only_composites_masked_pixels(tmp_path: Path) -> None:
 
     assert np.array_equal(repaired[0, 0], frame[0, 0])
     assert not np.array_equal(repaired[30, 45], frame[30, 45])
+
+
+def test_high_quality_tracked_mask_covers_complete_overlay_box() -> None:
+    mask = _solid_tracked_mask((85, 1222, 107, 29))
+
+    assert mask.shape == (29, 107)
+    assert np.all(mask == 255)
 
 
 def test_model_downloader_writes_cache_atomically(tmp_path: Path, monkeypatch) -> None:

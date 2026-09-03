@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from .diagnostics import current_context, install_exception_hooks
+from .diagnostic_mcp import DiagnosticFastMCP
+
 import os
 import uuid
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
 
 from .backend import YtDlpBackend
 from .browse_backend import SocialPostBrowserBackend
@@ -27,8 +29,9 @@ from .x_publish_contracts import XPublishInput
 from .x_publish_tool import XPublishTool
 
 
-mcp = FastMCP(
+mcp = DiagnosticFastMCP(
     "social-content",
+    diagnostic_component="social-content",
     instructions=(
         "Social browsing, local downloading, and explicitly approved one-time X publishing. "
         "Never expose session cookies, proxy credentials, passwords, verification codes, "
@@ -84,13 +87,14 @@ class Runtime:
 
     @staticmethod
     def context() -> ToolContext:
-        run_id = uuid.uuid4().hex
+        diagnostics = current_context()
+        run_id = diagnostics.get("tool_call_id") or uuid.uuid4().hex
         return ToolContext(
             tenant_id="local-agent",
-            trace_id=f"plugin-{run_id}",
+            trace_id=diagnostics.get("trace_id") or f"plugin-{run_id}",
             actor_type="agent",
             actor_id="social-content-plugin",
-            agent_run_id=run_id,
+            agent_run_id=diagnostics.get("execution_id") or run_id,
         )
 
 
@@ -116,6 +120,10 @@ async def browse_posts(
     max_items: int = 20,
     max_scrolls: int = 8,
 ) -> dict[str, Any]:
+    """Browse posts. For Douyin search, view must be top, media, or users
+    (not posts). For Douyin user browsing use posts; timeline/url use top.
+    query is required for search. session_ref must match the platform.
+    """
     request = BrowsePostsInput(**locals())
     result = await runtime().browse.execute(request, runtime().context())
     return result.model_dump(mode="json")
@@ -199,6 +207,7 @@ def _required_path(name: str, *, file: bool = False) -> Path:
 
 
 def main() -> None:
+    install_exception_hooks("social-content")
     mcp.run(transport="stdio")
 
 

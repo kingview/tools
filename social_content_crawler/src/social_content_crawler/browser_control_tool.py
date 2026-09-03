@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 from datetime import UTC, datetime
@@ -60,6 +62,7 @@ class BitBrowserControlTool:
     def spec(self) -> ToolSpec:
         return BROWSER_CONTROL_TOOL_SPEC
 
+    @logged("social-content", "social.browser_operate")
     async def execute(
         self,
         request: BrowserOperationInput,

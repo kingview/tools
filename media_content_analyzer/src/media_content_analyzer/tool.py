@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 import json
@@ -9,6 +11,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .contracts import AnalyzeContentInput, AuditEvent, ContentAnalysisOutput, ToolSpec
 from .errors import AnalyzerError, ErrorCode
 from .ports import AnalysisBackend, AnalysisCache, AuditSink, ToolContext
@@ -16,7 +20,7 @@ from .ports import AnalysisBackend, AnalysisCache, AuditSink, ToolContext
 
 TOOL_SPEC = ToolSpec(
     name="media.analyze_content",
-    version="1.1.1",
+    version="1.1.2",
     description="Analyze downloaded image, audio, and video artifacts into tags and summaries.",
     input_schema=AnalyzeContentInput.model_json_schema(),
     output_schema=ContentAnalysisOutput.model_json_schema(),
@@ -55,6 +59,7 @@ class MediaContentAnalyzerTool:
     def spec(self) -> ToolSpec:
         return TOOL_SPEC
 
+    @logged("media-content", "media.analyze_content")
     async def execute(
         self, request: AnalyzeContentInput, context: ToolContext
     ) -> ContentAnalysisOutput:
@@ -88,7 +93,7 @@ class MediaContentAnalyzerTool:
         except Exception as exc:
             error = AnalyzerError(
                 ErrorCode.ANALYSIS_FAILED,
-                "unexpected media analysis failure",
+                f"unexpected media analysis failure ({_safe_error_details(exc)})",
                 retryable=False,
             )
             raise error from exc
@@ -164,6 +169,20 @@ class MediaContentAnalyzerTool:
             raise AnalyzerError(ErrorCode.CONFIGURATION_ERROR, "unsafe work directory")
         destination.mkdir(parents=True, exist_ok=False)
         return destination
+
+
+def _safe_error_details(exc: Exception) -> str:
+    """Identify contract failures without logging media, raw model JSON or keys."""
+    if isinstance(exc, ValidationError):
+        fields = []
+        for item in exc.errors(include_input=False, include_context=False, include_url=False)[:5]:
+            location = ".".join(
+                str(part) if isinstance(part, int) or str(part).isidentifier() else "<field>"
+                for part in item["loc"]
+            )
+            fields.append(f"{location}: {item['type']}")
+        return f"ValidationError: {'; '.join(fields)}"[:500]
+    return type(exc).__name__
 
 
 def _cache_key(request: AnalyzeContentInput, pipeline_version: str) -> str:

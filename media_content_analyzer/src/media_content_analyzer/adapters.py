@@ -16,6 +16,7 @@ from .contracts import (
     TranscriptSegment,
 )
 from .ports import SemanticResult
+from .diagnostics import register_secrets
 
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
@@ -243,6 +244,7 @@ class OpenAICompatibleVisionModel:
         self._base_url = _normalize_openai_base_url(base_url)
         self._model = model
         self._api_key = api_key
+        register_secrets(api_key or "")
         self._timeout_seconds = timeout_seconds
         if max_images < 1:
             raise ValueError("max_images must be at least 1")
@@ -376,6 +378,7 @@ class OpenAICompatibleCopyGenerator:
         self._base_url = _normalize_openai_base_url(base_url)
         self._model = model
         self._api_key = api_key
+        register_secrets(api_key or "")
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
         self.name = f"openai-compatible:{model}"

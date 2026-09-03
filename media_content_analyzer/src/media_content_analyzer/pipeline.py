@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import record_exception
+
 import json
 import math
 import mimetypes
@@ -19,6 +21,8 @@ from .contracts import (
     Evidence,
     Tag,
     TagNamespace,
+    TAG_EVIDENCE_MAX_ITEMS,
+    TAG_LABEL_MAX_LENGTH,
     TranscriptSegment,
 )
 from .errors import AnalyzerError, ErrorCode
@@ -28,7 +32,7 @@ from .ports import OcrEngine, SemanticResult, Transcriber, VisionModel
 class LocalMediaAnalysisBackend:
     """Deterministic preprocessing followed by an optional local semantic model."""
 
-    BASE_PIPELINE_VERSION = "media-analysis-pipeline-1.1.1"
+    BASE_PIPELINE_VERSION = "media-analysis-pipeline-1.1.2"
 
     def __init__(
         self,
@@ -135,6 +139,7 @@ class LocalMediaAnalysisBackend:
                         language_hint=request.language_hint,
                     )
                 except Exception as exc:
+                    record_exception("media-content", "analysis.semantic_fallback", exc)
                     warnings.append(
                         "Semantic model failed; deterministic fallback used "
                         f"({_exception_summary(exc)})."
@@ -159,7 +164,9 @@ class LocalMediaAnalysisBackend:
         valid_evidence_ids = {item.evidence_id for item in evidence}
         semantic_refs = [ref for ref in semantic.evidence_refs if ref in valid_evidence_ids]
         if "visual-model-1" in valid_evidence_ids:
-            semantic_refs.append("visual-model-1")
+            # Keep direct visual evidence even when a dense OCR image exceeds
+            # the bounded per-tag reference budget. The full evidence is kept.
+            semantic_refs.insert(0, "visual-model-1")
         tags = _build_tags(
             semantic,
             {asset.modality for asset in asset_results if asset.modality != "unknown"},
@@ -217,6 +224,7 @@ class LocalMediaAnalysisBackend:
                 normalized.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
                 normalized.save(prepared, "JPEG", quality=88, optimize=True)
         except Exception as exc:
+            record_exception("media-content", "analysis.image_decode", exc)
             raise AnalyzerError(
                 ErrorCode.UNSUPPORTED_MEDIA, "image decoding or safety validation failed"
             ) from exc
@@ -230,6 +238,7 @@ class LocalMediaAnalysisBackend:
                 try:
                     ocr_text = _unique(self._ocr.extract(prepared))
                 except Exception as exc:
+                    record_exception("media-content", "analysis.image_ocr", exc)
                     warnings.append(f"OCR failed ({_exception_summary(exc)}).")
         for number, text in enumerate(ocr_text, start=1):
             evidence.append(
@@ -303,6 +312,7 @@ class LocalMediaAnalysisBackend:
                         try:
                             ocr_text.extend(self._ocr.extract(frame))
                         except Exception as exc:
+                            record_exception("media-content", "analysis.video_ocr", exc)
                             warnings.append(
                                 "Video-frame OCR failed "
                                 f"({_exception_summary(exc)})."
@@ -332,6 +342,7 @@ class LocalMediaAnalysisBackend:
                             audio_path, request.language_hint
                         )
                     except Exception as exc:
+                        record_exception("media-content", "analysis.speech_recognition", exc)
                         warnings.append(
                             "Speech recognition failed "
                             f"({_exception_summary(exc)})."
@@ -340,6 +351,7 @@ class LocalMediaAnalysisBackend:
                     try:
                         transcript = self._transcriber.transcribe(path, request.language_hint)
                     except Exception as exc:
+                        record_exception("media-content", "analysis.speech_recognition", exc)
                         warnings.append(
                             "Speech recognition failed "
                             f"({_exception_summary(exc)})."
@@ -685,17 +697,33 @@ def _build_tags(
     evidence_refs: list[str],
 ) -> list[Tag]:
     tags: list[Tag] = []
+    bounded_refs = _unique(evidence_refs)[:TAG_EVIDENCE_MAX_ITEMS]
+
+    def add(namespace: TagNamespace, label: str, *, confidence: float | None = None) -> None:
+        # Semantic fields may be verbose and have no tag-length constraint.
+        # Bound only their compact tag representation, not the full analysis.
+        label = " ".join(label.split())
+        if not label:
+            return
+        if len(label) > TAG_LABEL_MAX_LENGTH:
+            label = label[:TAG_LABEL_MAX_LENGTH - 1].rstrip() + "…"
+        tags.append(Tag(
+            namespace=namespace, label=label,
+            confidence=semantic.confidence if confidence is None else confidence,
+            evidence_refs=[] if namespace == TagNamespace.FORMAT else bounded_refs,
+        ))
+
     for topic in semantic.topics:
-        tags.append(Tag(namespace=TagNamespace.TOPIC, label=topic, confidence=semantic.confidence, evidence_refs=evidence_refs))
+        add(TagNamespace.TOPIC, topic)
     for entity in semantic.entities:
-        tags.append(Tag(namespace=TagNamespace.ENTITY, label=entity, confidence=semantic.confidence, evidence_refs=evidence_refs))
+        add(TagNamespace.ENTITY, entity)
     for modality in sorted(modalities):
-        tags.append(Tag(namespace=TagNamespace.FORMAT, label=modality, confidence=1.0, evidence_refs=[]))
-    tags.append(Tag(namespace=TagNamespace.SENTIMENT, label=semantic.sentiment, confidence=semantic.confidence, evidence_refs=evidence_refs))
+        add(TagNamespace.FORMAT, modality, confidence=1.0)
+    add(TagNamespace.SENTIMENT, semantic.sentiment)
     if semantic.commercial_intent:
-        tags.append(Tag(namespace=TagNamespace.COMMERCIAL, label=semantic.commercial_intent, confidence=semantic.confidence, evidence_refs=evidence_refs))
+        add(TagNamespace.COMMERCIAL, semantic.commercial_intent)
     for flag in semantic.safety_flags:
-        tags.append(Tag(namespace=TagNamespace.SAFETY, label=flag, confidence=semantic.confidence, evidence_refs=evidence_refs))
+        add(TagNamespace.SAFETY, flag)
     result: list[Tag] = []
     seen: set[tuple[TagNamespace, str]] = set()
     for tag in tags:

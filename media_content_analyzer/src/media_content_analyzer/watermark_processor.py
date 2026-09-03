@@ -41,6 +41,7 @@ class _DynamicCandidate:
     width: int
     height: int
     descriptor: object
+    kind: str = "edge"
 
 
 @dataclass(slots=True)
@@ -51,7 +52,7 @@ class _DynamicTrack:
 
 
 class OpenCvWatermarkBackend:
-    detector_version = "opencv-overlay-v5"
+    detector_version = "opencv-overlay-v6"
 
     def __init__(
         self,
@@ -486,7 +487,7 @@ def _detect_dynamic_regions(samples: VideoSamples) -> list[WatermarkRegion]:
                 continue
             if x <= 1 or y <= 1 or x + width >= target_width - 1 or y + height >= target_height - 1:
                 continue
-            if not 1.6 <= aspect <= 18.0 or area / box_area < 0.10:
+            if not 0.65 <= aspect <= 18.0 or area / box_area < 0.10:
                 continue
             descriptor = _edge_descriptor(edges[y : y + height, x : x + width])
             if descriptor is None:
@@ -501,6 +502,27 @@ def _detect_dynamic_regions(samples: VideoSamples) -> list[WatermarkRegion]:
                     descriptor=descriptor,
                 )
             )
+        # Platform exports often move a compound watermark between corners:
+        # a light platform badge, account text, and a circular account avatar.
+        # Edge grouping finds the text but needs shape-aware candidates for the
+        # filled badge and square avatar so all components reach the repairer.
+        for candidate in [
+            *_corner_badge_candidates(
+                frame_index, resized, gray, edges, target_width, target_height
+            ),
+            *_corner_avatar_candidates(
+                frame_index, resized, gray, edges, target_width, target_height
+            ),
+        ]:
+            # Prefer the shape-aware candidate over an overlapping generic
+            # edge group. Besides keeping the full filled area, this prevents
+            # an identical badge from being split into unrelated track kinds.
+            frame_candidates = [
+                existing
+                for existing in frame_candidates
+                if _candidate_iou(candidate, existing) < 0.55
+            ]
+            frame_candidates.append(candidate)
         per_frame.append(frame_candidates)
 
     tracks: list[_DynamicTrack] = []
@@ -513,6 +535,8 @@ def _detect_dynamic_regions(samples: VideoSamples) -> list[WatermarkRegion]:
                 if track_index in used_tracks or track.candidates[-1].frame_index == frame_index:
                     continue
                 previous = track.candidates[-1]
+                if candidate.kind != previous.kind:
+                    continue
                 aspect_ratio = (candidate.width / candidate.height) / (
                     previous.width / previous.height
                 )
@@ -579,7 +603,162 @@ def _detect_dynamic_regions(samples: VideoSamples) -> list[WatermarkRegion]:
             )
         )
     output.sort(key=lambda item: item.confidence, reverse=True)
-    return output[:2]
+    return output[:6]
+
+
+def _corner_badge_candidates(
+    frame_index: int,
+    frame: object,
+    gray: object,
+    edges: object,
+    width: int,
+    height: int,
+) -> list[_DynamicCandidate]:
+    """Detect persistent light platform pills/logos near a frame corner."""
+
+    import cv2
+    import numpy as np
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    light = ((gray >= 220) & (hsv[:, :, 1] <= 70)).astype(np.uint8) * 255
+    kernel_size = max(5, int(round(width * 0.012)))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    light = cv2.morphologyEx(
+        light,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+        iterations=2,
+    )
+    count, _, stats, _ = cv2.connectedComponentsWithStats(light, connectivity=8)
+    output: list[_DynamicCandidate] = []
+    for index in range(1, count):
+        x, y, box_width, box_height, area = [int(value) for value in stats[index]]
+        center_x = x + box_width / 2
+        center_y = y + box_height / 2
+        in_corner = (
+            (center_x <= width * 0.28 or center_x >= width * 0.72)
+            and (center_y <= height * 0.18 or center_y >= height * 0.82)
+        )
+        aspect = box_width / max(1, box_height)
+        fill_ratio = area / max(1, box_width * box_height)
+        if not in_corner:
+            continue
+        if not max(18, width * 0.025) <= box_width <= width * 0.28:
+            continue
+        if not max(8, height * 0.006) <= box_height <= max(
+            height * 0.10, width * 0.08
+        ):
+            continue
+        if not 0.7 <= aspect <= 8.0 or fill_ratio < 0.42:
+            continue
+        descriptor = _edge_descriptor(
+            edges[y : y + box_height, x : x + box_width]
+        )
+        if descriptor is None:
+            continue
+        output.append(
+            _DynamicCandidate(
+                frame_index=frame_index,
+                x=x,
+                y=y,
+                width=box_width,
+                height=box_height,
+                descriptor=descriptor,
+                kind="badge",
+            )
+        )
+    return output
+
+
+def _corner_avatar_candidates(
+    frame_index: int,
+    frame: object,
+    gray: object,
+    edges: object,
+    width: int,
+    height: int,
+) -> list[_DynamicCandidate]:
+    """Detect a repeated, colorful circular avatar that jumps between corners."""
+
+    import cv2
+    import numpy as np
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
+    maximum_radius = max(16, int(round(min(width, height) * 0.075)))
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(24, int(round(min(width, height) * 0.035))),
+        param1=110,
+        param2=28,
+        minRadius=max(10, int(round(width * 0.026))),
+        maxRadius=maximum_radius,
+    )
+    if circles is None:
+        return []
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yy, xx = np.ogrid[:height, :width]
+    output: list[_DynamicCandidate] = []
+    for raw_x, raw_y, raw_radius in circles[0]:
+        center_x = int(round(float(raw_x)))
+        center_y = int(round(float(raw_y)))
+        radius = int(round(float(raw_radius)))
+        in_corner = (
+            (center_x <= width * 0.20 or center_x >= width * 0.80)
+            and (center_y <= height * 0.15 or center_y >= height * 0.85)
+        )
+        if not in_corner:
+            continue
+        circle_mask = (xx - center_x) ** 2 + (yy - center_y) ** 2 <= radius**2
+        saturation = hsv[:, :, 1][circle_mask]
+        if saturation.size == 0:
+            continue
+        if float(np.mean(saturation)) < 45.0 or float(np.mean(saturation >= 60)) < 0.25:
+            continue
+        padded_radius = max(radius + 3, int(round(radius * 1.30)))
+        left = max(0, center_x - padded_radius)
+        top = max(0, center_y - padded_radius)
+        right = min(width, center_x + padded_radius + 1)
+        bottom = min(height, center_y + padded_radius + 1)
+        # A fully visible circular avatar produces a stable template. Large
+        # scene circles clipped by the frame edge are common false positives
+        # around people and furniture, and cannot be tracked reliably.
+        if (
+            center_x - padded_radius < 0
+            or center_y - padded_radius < 0
+            or center_x + padded_radius >= width
+            or center_y + padded_radius >= height
+        ):
+            continue
+        descriptor = _edge_descriptor(edges[top:bottom, left:right])
+        if descriptor is None:
+            continue
+        output.append(
+            _DynamicCandidate(
+                frame_index=frame_index,
+                x=left,
+                y=top,
+                width=right - left,
+                height=bottom - top,
+                descriptor=descriptor,
+                kind="avatar",
+            )
+        )
+    return output
+
+
+def _candidate_iou(left: _DynamicCandidate, right: _DynamicCandidate) -> float:
+    intersection_left = max(left.x, right.x)
+    intersection_top = max(left.y, right.y)
+    intersection_right = min(left.x + left.width, right.x + right.width)
+    intersection_bottom = min(left.y + left.height, right.y + right.height)
+    intersection = max(0, intersection_right - intersection_left) * max(
+        0, intersection_bottom - intersection_top
+    )
+    union = left.width * left.height + right.width * right.height - intersection
+    return intersection / max(1, union)
 
 
 def _edge_descriptor(edges: object) -> object | None:
@@ -869,6 +1048,16 @@ def _dynamic_fine_masks(
         mask = cv2.dilate(
             edges, np.ones((kernel_size, kernel_size), np.uint8), iterations=1
         )
+        # Filled platform pills and circular avatars must be removed as a
+        # whole. Inpainting only their outlines leaves the badge fill or
+        # profile photo visible. Text-only boxes have no dominant enclosed
+        # contour and keep the more conservative stroke mask.
+        contours, _ = cv2.findContours(
+            mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for contour in contours:
+            if cv2.contourArea(contour) >= width * height * 0.18:
+                cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
         masks.append(_safe_local_mask(mask, width, height))
     return masks
 

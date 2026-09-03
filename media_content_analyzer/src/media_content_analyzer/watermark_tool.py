@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 import json
@@ -24,7 +26,7 @@ from .ports import AuditSink, ToolContext
 
 WATERMARK_TOOL_SPEC = ToolSpec(
     name="media.process_watermark",
-    version="1.4.3",
+    version="1.4.5",
     description="Detect static and recurring moving video watermarks, reconstruct overlay pixels with local temporal repair or a portable CoreML/CUDA inpainting worker, and create authorized derivatives without overwriting the original.",
     input_schema=ProcessWatermarkInput.model_json_schema(),
     output_schema=ProcessWatermarkOutput.model_json_schema(),
@@ -77,6 +79,7 @@ class MediaWatermarkProcessorTool:
     def spec(self) -> ToolSpec:
         return WATERMARK_TOOL_SPEC
 
+    @logged("media-content", "media.process_watermark")
     async def execute(
         self,
         request: ProcessWatermarkInput,

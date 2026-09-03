@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from media_content_analyzer import AnalyzeContentInput, ArtifactRef
@@ -52,6 +54,58 @@ class FailingVision:
 
     def understand(self, *, images, trusted_context, untrusted_content, language_hint):
         raise ConnectionError("Ollama is unavailable")
+
+
+@pytest.mark.parametrize("reference_count", [49, 50, 173])
+def test_dense_image_model_references_fit_tag_contract_without_losing_evidence(tmp_path, reference_count):
+    class DenseOcr:
+        name = "dense-ocr"
+
+        def extract(self, image_path):
+            return [f"产品部件 {index}" for index in range(173)]
+
+    class DenseVision(FakeVision):
+        def understand(self, **kwargs):
+            # Use the same valid model contract, but reference a dense product
+            # diagram like a real OCR-heavy image instead of a two-line fixture.
+            base = super().understand(**{**kwargs, "untrusted_content": "新品发布会"})
+            return replace(base, evidence_refs=[f"ocr-1-{i}" for i in range(1, reference_count + 1)])
+
+    image_path = tmp_path / "diagram.jpg"
+    Image.new("RGB", (100, 150), color="white").save(image_path)
+    backend = LocalMediaAnalysisBackend(ocr_engine=DenseOcr(), transcriber=FakeTranscriber(), vision_model=DenseVision())
+    result = backend.analyze(_request(image_path, post_text=None), [image_path], tmp_path / "work")
+    assert result.summary == "品牌在上海举行新品发布会。"
+    assert len(result.assets[0].ocr_text) == 173
+    assert len(result.evidence) == 174  # All OCR plus visual-model evidence remain available.
+    evidence_ids = {item.evidence_id for item in result.evidence}
+    for tag in result.tags:
+        assert len(tag.evidence_refs) <= 50
+        assert set(tag.evidence_refs) <= evidence_ids
+        if tag.namespace.value != "format":
+            assert "visual-model-1" in tag.evidence_refs
+
+
+def test_verbose_and_blank_model_tags_preserve_full_semantic_fields(tmp_path):
+    long_text = "模块化机器人结构与视觉功能说明" * 30
+
+    class VerboseVision(FakeVision):
+        def understand(self, **kwargs):
+            return replace(super().understand(**kwargs),
+                topics=["", "  ", long_text, long_text], entities=[long_text],
+                sentiment=long_text, commercial_intent=long_text, safety_flags=[long_text],
+                evidence_refs=["ocr-1-1"] * 60 + ["invented", "visual-model-1"])
+
+    image_path = tmp_path / "verbose.png"
+    Image.new("RGB", (100, 150), color="white").save(image_path)
+    backend = LocalMediaAnalysisBackend(ocr_engine=FakeOcr(), transcriber=FakeTranscriber(), vision_model=VerboseVision())
+    result = backend.analyze(_request(image_path), [image_path], tmp_path / "work")
+    assert result.commercial_intent == long_text
+    assert result.entities == [long_text]
+    assert len([tag for tag in result.tags if tag.namespace.value == "topic"]) == 1
+    for tag in result.tags:
+        assert 1 <= len(tag.label) <= 200
+        assert tag.evidence_refs == ([] if tag.namespace.value == "format" else ["visual-model-1", "ocr-1-1"])
 
 
 def _request(path: Path, **changes) -> AnalyzeContentInput:

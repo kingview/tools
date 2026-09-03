@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 import json
@@ -18,7 +20,7 @@ from .ports import AuditSink, CopyGenerator, ToolContext
 
 COPY_TOOL_SPEC = ToolSpec(
     name="media.generate_post_copy",
-    version="1.0.0",
+    version="1.0.2",
     description="Generate platform-aware social post copy grounded in an analysis result.",
     input_schema=GeneratePostCopyInput.model_json_schema(),
     output_schema=GeneratePostCopyOutput.model_json_schema(),
@@ -50,6 +52,7 @@ class ContentCopyGeneratorTool:
     def spec(self) -> ToolSpec:
         return COPY_TOOL_SPEC
 
+    @logged("media-content", "media.generate_post_copy")
     async def execute(
         self, request: GeneratePostCopyInput, context: ToolContext
     ) -> GeneratePostCopyOutput:

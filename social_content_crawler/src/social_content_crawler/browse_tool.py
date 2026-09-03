@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .diagnostics import logged
+
 import asyncio
 import hashlib
 from datetime import UTC, datetime
@@ -59,6 +61,7 @@ class SocialPostBrowseTool:
     def spec(self) -> ToolSpec:
         return BROWSE_TOOL_SPEC
 
+    @logged("social-content", "social.browse_posts")
     async def execute(
         self,
         request: BrowsePostsInput,
