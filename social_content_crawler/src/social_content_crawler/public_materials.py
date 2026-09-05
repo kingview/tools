@@ -1,90 +1,18 @@
 """Phase-one link discovery; anonymous by default, optional explicit BitBrowser."""
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Literal
 
 from .url_policy import PublicHttpsUrlPolicy
 from .transfer_progress import report_transfer
 
 
-class DiscoveryInput(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    platform: Literal['telegram', 'douyin', 'xiaohongshu']
-    source: Literal['timeline', 'search', 'user', 'url'] = 'url'
-    query: str | None = Field(default=None, max_length=300)
-    user_key: str | None = Field(default=None, max_length=300)
-    start_url: str | None = None
-    sort: Literal['top', 'latest', 'likes'] = 'latest'
-    media_type: Literal['both', 'image', 'video'] = 'both'
-    max_items: int = Field(default=100, ge=1, le=500)
-    days: int | None = Field(default=30, ge=1, le=36500)
-    start_date: datetime | None = None
-    end_date: datetime | None = None
-    minimum_likes: int | None = Field(default=None, ge=0)
-    minimum_views: int | None = Field(default=None, ge=0)
-    browser_engine: Literal['standard', 'bitbrowser'] = 'standard'
-    execution_mode: Literal['automation', 'rpa'] = 'automation'
-    session_ref: str | None = None
-    access_interval_seconds: float = Field(default=1, ge=.3, le=30)
-    timeout_seconds: float = Field(default=300, ge=10, le=3600)
-
-    @model_validator(mode='after')
-    def validate_source(self):
-        if self.browser_engine == 'bitbrowser':
-            if self.platform == 'telegram':
-                raise ValueError('Telegram 公开频道固定使用标准浏览器')
-            prefix = 'xhs' if self.platform == 'xiaohongshu' else 'douyin'
-            if not re.fullmatch(r'sess_'+prefix+r'_[A-Za-z0-9_-]{20,80}', self.session_ref or ''):
-                raise ValueError('请选择对应平台的比特浏览器窗口')
-        elif self.session_ref:
-            raise ValueError('标准浏览器不能复用登录会话')
-        if self.platform == 'telegram' and self.execution_mode != 'automation':
-            raise ValueError('Telegram 公开频道固定使用高效模式')
-        if self.platform == 'telegram':
-            if self.source not in {'user', 'url'}:
-                raise ValueError('Telegram 一期仅支持公开频道')
-            _, message = telegram_address(self.start_url or self.user_key or '')
-            if message:
-                raise ValueError('链接发现请填写频道地址，具体消息地址请使用下载工具')
-        elif self.source == 'url':
-            parsed = urlsplit(self.start_url or '')
-            domain = 'douyin.com' if self.platform == 'douyin' else 'xiaohongshu.com'
-            if parsed.scheme != 'https' or parsed.username or parsed.password or not (parsed.hostname == domain or (parsed.hostname or '').endswith('.' + domain)):
-                raise ValueError('来源网址与平台不匹配')
-        if self.source == 'search' and not (self.query or '').strip():
-            raise ValueError('请输入关键词')
-        if self.source == 'user' and self.platform != 'telegram' and not re.fullmatch(r'[A-Za-z0-9_-]+', self.user_key or ''):
-            raise ValueError('请提供明确账号 ID 或改用账号主页 URL；不能擅自选择同名账号')
-        if self.start_date and self.end_date and utc(self.start_date) > utc(self.end_date):
-            raise ValueError('开始时间不能晚于结束时间')
-        return self
-
-
-def utc(value):
-    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-
-
-def telegram_address(raw, *, message=False):
-    raw = raw.strip()
-    if re.fullmatch(r'@?[A-Za-z][A-Za-z0-9_]{3,63}', raw):
-        raw = 'https://t.me/' + raw.lstrip('@')
-    parsed = urlsplit(raw)
-    match = re.fullmatch(r'/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,63})(?:/([1-9][0-9]*))?/?', parsed.path)
-    if parsed.scheme != 'https' or parsed.hostname not in {'t.me', 'telegram.me'} or parsed.username or parsed.password or not match or match[1] in {'joinchat', 'addlist', 'share', 'proxy'}:
-        raise ValueError('仅支持 Telegram 公开频道，不支持私密群、邀请或登录链接')
-    if message and not match[2]:
-        raise ValueError('下载需要具体消息 URL；频道链接请先使用链接发现')
-    return match[1], match[2]
+from .discovery_contract import DiscoveryInput, utc, telegram_address
 
 
 def accepted(post, request, now=None):
@@ -142,14 +70,7 @@ def telegram_rows(page):
     return rows
 
 
-def export_links(posts, folder):
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / 'links.txt').write_text('\n'.join(p['url'] for p in posts), encoding='utf-8')
-    (folder / 'metadata.json').write_text(json.dumps(posts, ensure_ascii=False, indent=2), encoding='utf-8')
-    with (folder / 'links.csv').open('w', encoding='utf-8-sig', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=['url','post_id','author_name','published_at','text'])
-        writer.writeheader()
-        writer.writerows({k:p.get(k) for k in writer.fieldnames} for p in posts)
+from .discovery_journal import export_links
 
 
 def discover(request: DiscoveryInput, output_root: Path, registry=None):

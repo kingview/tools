@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import tempfile
 import threading
@@ -11,6 +10,7 @@ from time import monotonic, sleep
 from typing import BinaryIO, Iterator
 
 from .errors import CrawlerError, ErrorCode
+from .browser_lock_contract import OPERATION_LOCK_DIRECTORY, operation_key
 
 
 class ProfileTaskCoordinator:
@@ -22,7 +22,7 @@ class ProfileTaskCoordinator:
     """
 
     def __init__(self, root: Path | None = None) -> None:
-        self.root = root or Path(tempfile.gettempdir()) / "social-agent-profile-locks"
+        self.root = root or Path(tempfile.gettempdir()) / OPERATION_LOCK_DIRECTORY
         self.root.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
             self.root.chmod(0o700)
@@ -37,7 +37,7 @@ class ProfileTaskCoordinator:
         *,
         timeout_seconds: float = 5.0,
     ) -> Iterator[None]:
-        key = hashlib.sha256(f"{api_url}|{profile_id}".encode("utf-8")).hexdigest()
+        key = operation_key(api_url,profile_id)
         with self._guard:
             local_lock = self._locks[key]
         if not local_lock.acquire(timeout=max(0.0, timeout_seconds)):

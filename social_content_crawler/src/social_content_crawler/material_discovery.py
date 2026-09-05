@@ -11,11 +11,12 @@ from .browse_backend import (
     build_source_url, normalize_rows,
 )
 from .browse_contracts import BrowsePlatform, BrowseSource, BrowseView
-from .errors import CrawlerError
 from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR
-from .public_materials import accepted, export_links, telegram_address, telegram_rows
+from .public_materials import telegram_address, telegram_rows
 from .sessions import BitBrowserClient
-from playwright.sync_api import TimeoutError as BrowserTimeout
+from .discovery_runtime import DiscoveryDeadline, BrowserTimeout, wait_for_access
+from .discovery_state import DiscoveryState
+from .discovery_journal import DiscoveryJournal
 
 
 def source(request):
@@ -84,95 +85,50 @@ def advance(page, request, address, model, raw):
 
 def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=60):
     address, model = source(request)
-    selected, seen = [], set()
-    duplicates, filtered, stagnant = 0, 0, 0
-    started, warnings, reason = clock(), [], 'exhausted'
-    needs_review = False
-
-    def budget():
-        remaining = request.timeout_seconds-(clock()-started)
-        if remaining <= 0:
-            raise BrowserTimeout('discovery deadline')
-        milliseconds = max(1, min(30000, remaining*1000))
-        page.set_default_timeout(milliseconds)
-        page.set_default_navigation_timeout(milliseconds)
-        return remaining
-
-    def ordered(posts):
-        if request.sort == 'likes':
-            return sorted(posts,key=lambda p:p.get('metrics',{}).get('likes') or 0,reverse=True)
-        if request.sort == 'latest':
-            return sorted(posts,key=lambda p:p.get('published_at') or '',reverse=True)
-        return posts
-
-    # Even an initial navigation timeout leaves a valid empty export and a
-    # structured result, rather than hiding partial output behind an exception.
-    export_links([], folder)
+    state = DiscoveryState(request)
+    deadline = DiscoveryDeadline(page,request.timeout_seconds,clock=clock)
+    journal = DiscoveryJournal(folder)
+    journal.save(state)
     try:
-        budget()
-        if not _same_navigation_url(page.url, address):
-            page.goto(address, wait_until='domcontentloaded')
+        deadline.check()
+        if not _same_navigation_url(page.url,address):
+            page.goto(address,wait_until='domcontentloaded')
         for _ in range(500):
-            budget()
+            deadline.check()
             if model is not None:
-                try:
-                    _raise_if_login_required(page, model.platform)
-                except CrawlerError as exc:
-                    needs_review, reason = True, 'login_required'
-                    warnings.append(str(exc) if request.browser_engine == 'bitbrowser'
-                                    else '标准浏览器页面要求登录；请改用已登录的比特窗口重新执行。')
+                access = wait_for_access(page,request,model.platform,deadline,
+                    validate_login=_raise_if_login_required,challenge_visible=_platform_challenge_visible,
+                    review_wait_seconds=review_wait_seconds)
+                if not access.ready:
+                    state.needs_review,state.reason = True,access.reason
+                    state.warnings.append(access.warning)
                     break
-                if _platform_challenge_visible(page):
-                    # Never solve or dismiss verification. Keep the environment
-                    # alive for bounded manual intervention and check again.
-                    page.bring_to_front()
-                    until = min(started+request.timeout_seconds, clock()+review_wait_seconds)
-                    while clock() < until and _platform_challenge_visible(page):
-                        page.wait_for_timeout(min(500,max(1,(until-clock())*1000)))
-                    if _platform_challenge_visible(page):
-                        needs_review, reason = True, 'manual_review'
-                        warnings.append('页面需要人工验证。请在浏览器完成验证后继续，已发现链接会保留。')
-                        break
-            remaining = budget()
-            page.wait_for_timeout(min(request.access_interval_seconds*1000,remaining*1000))
-            budget()
+            deadline.wait(request.access_interval_seconds)
             raw = (telegram_rows(page) if model is None else
-                   [post.model_dump(mode='json') for post in normalize_rows(model.platform, _extract_rows(page, model), 500)])
-            new = 0
-            for post in raw:
-                if post['url'] in seen:
-                    duplicates += 1
-                    continue
-                seen.add(post['url'])
-                new += 1
-                if accepted(post, request):
-                    selected.append(post)
-                else:
-                    filtered += 1
-            # Order BEFORE capping: Telegram DOM rows are oldest-first, so
-            # requesting the latest one must not return the first DOM row.
-            export_links(ordered(selected)[:request.max_items], folder)
-            if len(selected) >= request.max_items:
-                reason = 'target_reached'
+                [post.model_dump(mode='json') for post in normalize_rows(model.platform,_extract_rows(page,model),500)])
+            state.add(raw)
+            if model is None:
+                ids=[int(p['post_id']) for p in raw if str(p.get('post_id','')).isdigit()]
+                state.cursor=str(min(ids)) if ids else None
+            if state.reached_target:
+                state.reason='target_reached'
+            journal.save(state)
+            if state.reached_target:
                 break
-            stagnant = 0 if new else stagnant+1
-            budget()
-            if stagnant >= 3 or not advance(page, request, address, model, raw):
+            deadline.check()
+            if state.stagnant>=3 or not advance(page,request,address,model,raw):
                 break
     except BrowserTimeout:
-        reason = 'timeout'
-        warnings.append('已达到运行或页面等待时限；已发现链接已保存，可继续处理这些结果。')
-    if request.sort == 'likes':
-        warnings.append('点赞排序依据本次可访问结果，不代表平台全量排名。')
-    selected = ordered(selected)[:request.max_items]
-    export_links(selected, folder)
-    if len(selected) < request.max_items and not needs_review:
-        warnings.append('符合筛选条件的可访问链接不足，已保留当前结果。未知日期不视为通过时间筛选。')
-    return {'posts':selected, 'count':len(selected), 'requested':request.max_items,
-            'found':len(seen), 'skipped_duplicates':duplicates, 'filtered_out':filtered,
-            'completed':len(selected)==request.max_items, 'needs_human_review':needs_review,
-            'completion_reason':reason, 'warnings':warnings, 'output_directory':str(folder),
-            'browser_engine':request.browser_engine, 'execution_mode':request.execution_mode}
+        state.reason='timeout'
+        state.warnings.append('已达到运行或页面等待时限；已发现链接已保存，可继续处理这些结果。')
+    except Exception:
+        state.reason='error'
+        raise
+    finally:
+        # Unexpected browser errors still leave the last valid selection and
+        # cursor on disk. No cookies, browser handles or credentials are stored.
+        journal.save(state)
+    return state.result(folder)
 
 
 def discover(request, output_root, registry=None):
