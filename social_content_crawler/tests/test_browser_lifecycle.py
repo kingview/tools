@@ -64,6 +64,17 @@ def test_existing_window_and_original_tabs_are_preserved(scope, monkeypatch):
     assert json.loads(path.read_text())["cleaned"]
 
 
+def test_human_review_resources_are_not_cleaned(scope,monkeypatch):
+    path=ledger(scope)
+    monkeypatch.setattr(lifecycle,'_snapshot',lambda _:snapshot(['existing','task-tab']))
+    lifecycle.preserve_for_review(ENDPOINT)
+    assert json.loads(path.read_text())['awaiting_human_review']
+    client=Mock()
+    result=lifecycle.cleanup(scope,EXECUTION,client_factory=lambda _:client)
+    client.close_profile.assert_not_called()
+    assert result['closed_tabs']==0 and result['warnings']
+
+
 def test_task_opened_window_is_closed_and_cleanup_is_idempotent(scope, monkeypatch):
     result, client, close_tabs, path = run_cleanup(scope, monkeypatch)
     client.close_profile.assert_called_once_with("profile")

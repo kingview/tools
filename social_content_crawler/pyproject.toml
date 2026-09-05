@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-content-crawler"
-version = "0.9.23"
+version = "0.9.24"
 description = "Contract-first social browsing, downloading, and approved X publishing for local agents"
 readme = "README.md"
 requires-python = ">=3.11"

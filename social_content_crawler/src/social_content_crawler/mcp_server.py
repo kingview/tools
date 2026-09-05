@@ -45,6 +45,7 @@ mcp = DiagnosticFastMCP(
 class Runtime:
     def __init__(self) -> None:
         registry = SessionRegistry(_required_path("SOCIAL_AGENT_SESSION_REGISTRY", file=True))
+        self.registry = registry
         self.output_root = _required_path("SOCIAL_AGENT_OUTPUT_ROOT")
         audit = InMemoryAuditSink()
         limiter = LocalRateLimiter()
@@ -182,9 +183,15 @@ async def download_media(
 
 @mcp.tool()
 async def discover_public_materials(options: dict[str, Any]) -> dict[str, Any]:
-    """Discover filtered links in a fresh anonymous Chrome; no session is read."""
+    """Discover filtered links: fresh anonymous browser, or explicit BitBrowser session.
+
+    Telegram public channels always use anonymous standard browsing. This legacy
+    tool name remains stable; browser_engine and execution_mode select behavior.
+    """
     from .public_materials import DiscoveryInput, discover
-    return await asyncio.to_thread(discover, DiscoveryInput.model_validate(options), runtime().output_root)
+    request = DiscoveryInput.model_validate(options)
+    registry = runtime().registry if request.browser_engine == 'bitbrowser' else None
+    return await asyncio.to_thread(discover, request, runtime().output_root, registry)
 
 
 @mcp.tool()

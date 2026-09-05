@@ -1,23 +1,18 @@
-"""Phase-one public discovery. Never attaches to a signed-in browser."""
+"""Phase-one link discovery; anonymous by default, optional explicit BitBrowser."""
 from __future__ import annotations
 
 import csv
 import hashlib
 import json
 import re
-import time
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Literal
 
-from .browse_contracts import BrowsePlatform, BrowseSource, BrowseView
-from .browse_backend import _extract_rows, build_source_url, normalize_rows
 from .url_policy import PublicHttpsUrlPolicy
 from .transfer_progress import report_transfer
 
@@ -37,13 +32,30 @@ class DiscoveryInput(BaseModel):
     end_date: datetime | None = None
     minimum_likes: int | None = Field(default=None, ge=0)
     minimum_views: int | None = Field(default=None, ge=0)
+    browser_engine: Literal['standard', 'bitbrowser'] = 'standard'
+    execution_mode: Literal['automation', 'rpa'] = 'automation'
+    session_ref: str | None = None
+    access_interval_seconds: float = Field(default=1, ge=.3, le=30)
+    timeout_seconds: float = Field(default=300, ge=10, le=3600)
 
     @model_validator(mode='after')
     def validate_source(self):
+        if self.browser_engine == 'bitbrowser':
+            if self.platform == 'telegram':
+                raise ValueError('Telegram 公开频道固定使用标准浏览器')
+            prefix = 'xhs' if self.platform == 'xiaohongshu' else 'douyin'
+            if not re.fullmatch(r'sess_'+prefix+r'_[A-Za-z0-9_-]{20,80}', self.session_ref or ''):
+                raise ValueError('请选择对应平台的比特浏览器窗口')
+        elif self.session_ref:
+            raise ValueError('标准浏览器不能复用登录会话')
+        if self.platform == 'telegram' and self.execution_mode != 'automation':
+            raise ValueError('Telegram 公开频道固定使用高效模式')
         if self.platform == 'telegram':
             if self.source not in {'user', 'url'}:
                 raise ValueError('Telegram 一期仅支持公开频道')
-            telegram_address(self.start_url or self.user_key or '')
+            _, message = telegram_address(self.start_url or self.user_key or '')
+            if message:
+                raise ValueError('链接发现请填写频道地址，具体消息地址请使用下载工具')
         elif self.source == 'url':
             parsed = urlsplit(self.start_url or '')
             domain = 'douyin.com' if self.platform == 'douyin' else 'xiaohongshu.com'
@@ -140,64 +152,10 @@ def export_links(posts, folder):
         writer.writerows({k:p.get(k) for k in writer.fieldnames} for p in posts)
 
 
-def discover(request: DiscoveryInput, output_root: Path):
-    from playwright.sync_api import sync_playwright
-    selected, seen = [], set()
-    warnings = []
-    started = time.monotonic()
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel='chrome', headless=True)
-        try:
-            page = browser.new_page()
-            page.set_default_timeout(30000)
-            if request.platform == 'telegram':
-                channel, _ = telegram_address(request.start_url or request.user_key or '')
-                address = 'https://t.me/s/' + channel
-                model = None
-            else:
-                view = BrowseView.LATEST if request.platform == 'xiaohongshu' and request.source == 'search' and request.sort == 'latest' else BrowseView.POSTS if request.source == 'user' else BrowseView.TOP
-                model = SimpleNamespace(platform=BrowsePlatform(request.platform), source=BrowseSource(request.source),
-                    view=view, query=request.query, user_key=request.user_key, start_url=request.start_url)
-                address = build_source_url(model)
-            page.goto(address, wait_until='domcontentloaded')
-            stagnant = 0
-            for _ in range(150):
-                if time.monotonic()-started > 300:
-                    warnings.append('发现阶段达到 5 分钟上限；保留已发现链接')
-                    break
-                page.wait_for_timeout(700)
-                raw = telegram_rows(page) if model is None else [p.model_dump(mode='json') for p in normalize_rows(model.platform, _extract_rows(page, model), 500)]
-                new = [p for p in raw if p['url'] not in seen]
-                for post in new:
-                    seen.add(post['url'])
-                    if accepted(post, request):
-                        selected.append(post)
-                if len(selected) >= request.max_items:
-                    break
-                stagnant = 0 if new else stagnant + 1
-                if stagnant >= 3:
-                    break
-                if model is None:
-                    ids = [int(p['post_id']) for p in raw]
-                    if not ids or min(ids) <= 1:
-                        break
-                    page.goto(address + '?before=' + str(min(ids)), wait_until='domcontentloaded')
-                else:
-                    page.mouse.wheel(0, 900)
-            if request.sort == 'likes':
-                selected.sort(key=lambda p:p.get('metrics', {}).get('likes') or 0, reverse=True)
-                warnings.append('点赞排序依据本次可访问结果，不代表平台全量排名')
-            elif request.sort == 'latest':
-                selected.sort(key=lambda p:p.get('published_at') or '', reverse=True)
-            selected = selected[:request.max_items]
-            if len(selected) < request.max_items:
-                warnings.append('符合条件的可访问结果不足；未知日期或不满足筛选的帖子不计入数量。登录或验证码限制请使用已注册窗口人工处理。')
-            folder = output_root / 'discovered-links' / uuid.uuid4().hex
-            export_links(selected, folder)
-            return {'posts': selected, 'count': len(selected), 'requested': request.max_items,
-                    'completed': len(selected) == request.max_items, 'warnings': warnings, 'output_directory': str(folder)}
-        finally:
-            browser.close()  # Only our anonymous browser, never a user's window.
+def discover(request: DiscoveryInput, output_root: Path, registry=None):
+    # Retain the public import path for existing plugin callers.
+    from .material_discovery import discover as run
+    return run(request, output_root, registry)
 
 
 def download_telegram(url: str, output_root: Path, max_bytes=1000*1024*1024):

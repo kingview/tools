@@ -133,6 +133,19 @@ def task_manages_pages() -> bool:
     return _execution_scope() is not None
 
 
+def preserve_for_review(endpoint: str) -> None:
+    """Do not discard an explicitly identified environment awaiting the user."""
+    scope = _execution_scope()
+    if scope is None:
+        return
+    snapshot = _snapshot(endpoint)
+    for path in _directory(*scope).glob('*.json'):
+        data = json.loads(path.read_text())
+        if data.get('instance') == snapshot['instance'] and data.get('endpoint') == snapshot['endpoint']:
+            data['awaiting_human_review'] = True
+            _save(path, data)
+
+
 def record_task_popup(page, opener, endpoint: str) -> None:
     # Never claim an unrelated tab the user opened during an action.
     try:
@@ -168,6 +181,9 @@ def cleanup(root: Path, execution_id: str, *, client_factory=None, coordinator=N
         try:
             data = json.loads(path.read_text())
             if data.get("execution_id") != execution_id or data.get("cleaned"):
+                continue
+            if data.get('awaiting_human_review'):
+                result['warnings'].append('浏览器正在等待人工处理，已保留对应窗口和标签页。')
                 continue
             client = client_factory(validate_loopback_api_url(data["api_url"]))
             with coordinator.hold(data["api_url"], data["profile_id"], timeout_seconds=0):
