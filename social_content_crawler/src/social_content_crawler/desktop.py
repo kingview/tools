@@ -198,6 +198,34 @@ class RegisteredSessionsDialog(_ReadyDialog):
         layout.addWidget(self.title_label)
         layout.addWidget(copy)
 
+        rule = QLabel(
+            "自动发现命名规则：平台-用途-编号，例如 DY-素材-01、XHS-美女-01、"
+            "X-发布-01、TG-频道-01；也支持抖音、小红书、Twitter、Telegram 前缀。"
+        )
+        rule.setObjectName("dialogCopy")
+        rule.setWordWrap(True)
+        layout.addWidget(rule)
+        auto_row = QHBoxLayout()
+        self.api_url_input = QLineEdit()
+        self.api_url_input.setObjectName("sessionInput")
+        known_sessions = self._registry.list()
+        self.api_url_input.setText(
+            os.getenv(
+                "BITBROWSER_API_URL",
+                known_sessions[-1].api_url
+                if known_sessions
+                else "http://127.0.0.1:54345",
+            )
+        )
+        self.api_url_input.setPlaceholderText("比特浏览器本地 API 地址")
+        self.api_url_input.setFixedHeight(48)
+        self.auto_register_button = QPushButton("自动发现并注册")
+        self.auto_register_button.setObjectName("primaryButton")
+        self.auto_register_button.clicked.connect(self.auto_register_windows)
+        auto_row.addWidget(self.api_url_input, 1)
+        auto_row.addWidget(self.auto_register_button)
+        layout.addLayout(auto_row)
+
         self.registered_list = QListWidget()
         self.registered_list.setObjectName("registeredWindows")
         self.registered_list.setMinimumHeight(240)
@@ -220,7 +248,12 @@ class RegisteredSessionsDialog(_ReadyDialog):
         close_button = QPushButton("完成")
         close_button.setObjectName("secondaryButton")
         close_button.clicked.connect(self.accept)
-        for button in (self.register_new_button, self.remove_button, close_button):
+        for button in (
+            self.auto_register_button,
+            self.register_new_button,
+            self.remove_button,
+            close_button,
+        ):
             button.setFixedHeight(48)
         close_row = QHBoxLayout()
         close_row.addWidget(self.register_new_button)
@@ -242,6 +275,35 @@ class RegisteredSessionsDialog(_ReadyDialog):
             return
         self._refresh_registered()
         self.sessions_changed.emit()
+
+    def auto_register_windows(self) -> None:
+        self.auto_register_button.setEnabled(False)
+        self.auto_register_button.setText("正在发现…")
+        QApplication.processEvents()
+        try:
+            report = self._registry.auto_register_named_profiles(
+                self.api_url_input.text().strip()
+            )
+        except (CrawlerError, OSError) as exc:
+            record_exception("social-content", "desktop.handled", exc)
+            QMessageBox.warning(self, "自动发现没有完成", str(exc))
+            return
+        finally:
+            self.auto_register_button.setEnabled(True)
+            self.auto_register_button.setText("自动发现并注册")
+        selected = report.registered[-1].session_ref if report.registered else None
+        self._refresh_registered(selected)
+        if report.registered:
+            self.sessions_changed.emit()
+        lines = [
+            f"发现 {report.discovered} 个 Profile，新增注册 {len(report.registered)} 个，"
+            f"已注册 {len(report.existing)} 个。"
+        ]
+        if report.unmatched:
+            lines.append(f"{len(report.unmatched)} 个名称不符合规则，已跳过。")
+        if report.errors:
+            lines.append("未能注册：\n" + "\n".join(report.errors[:8]))
+        QMessageBox.information(self, "自动发现完成", "\n\n".join(lines))
 
     def _refresh_registered(self, selected_ref: str | None = None) -> None:
         current = self.registered_list.currentItem()

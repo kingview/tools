@@ -11,6 +11,8 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 
 from .contracts import DownloadInput, DownloadMode, MediaFormat, TelegramDownloadScope
 from .errors import CrawlerError, ErrorCode
+from .telegram_dom import find_message
+from .transfer_progress import check_transfer_active
 
 
 _PUBLIC_POST = re.compile(r"^/([A-Za-z0-9_]{4,})/(\d+)")
@@ -46,12 +48,6 @@ def resolve_telegram_web_url(page: Page, value: str) -> str:
         return page.url
     title = peer["title"]
     title_nodes = page.get_by_text(title, exact=True)
-    if not title_nodes.count() and handle:
-        search = page.locator('input[placeholder="Search"]').first
-        if search.count():
-            search.fill(handle)
-            page.wait_for_timeout(1_500)
-            title_nodes = page.get_by_text(title, exact=True)
     for index in range(title_nodes.count()):
         candidate = title_nodes.nth(index)
         if candidate.is_visible(timeout=300):
@@ -59,6 +55,33 @@ def resolve_telegram_web_url(page: Page, value: str) -> str:
             page.wait_for_selector(".MessageList", state="attached", timeout=10_000)
             page.wait_for_timeout(500)
             return page.url
+    # A matching title can exist in Telegram's hidden/virtualized list. Search
+    # again whenever no *visible* title was clicked, not only when the locator
+    # count is zero.
+    if handle:
+        search = page.locator('input[placeholder="Search"]').first
+        if search.count() and search.is_visible(timeout=300):
+            search.fill(handle)
+            page.wait_for_timeout(1_500)
+            title_nodes = page.get_by_text(title, exact=True)
+            for index in range(title_nodes.count()):
+                candidate = title_nodes.nth(index)
+                if candidate.is_visible(timeout=300):
+                    candidate.click()
+                    page.wait_for_selector(".MessageList", state="attached", timeout=10_000)
+                    page.wait_for_timeout(500)
+                    return page.url
+    # The chat list can be hidden while Telegram restores a pane or closes a
+    # media viewer.  The peer ID has already been resolved from Telegram's own
+    # local state, so use the SPA hash route instead of requiring a visible
+    # title node.  This keeps private/numeric peers working too.
+    try:
+        page.goto(target_url, wait_until="domcontentloaded", timeout=10_000)
+        page.wait_for_selector(".MessageList", state="attached", timeout=10_000)
+        page.wait_for_timeout(500)
+        return page.url
+    except PlaywrightTimeoutError:
+        pass
     raise CrawlerError(
         ErrorCode.BROWSE_FAILED,
         f"Telegram Web 已识别频道 {title}，但无法在当前窗口打开。请手动打开后重试。",
@@ -158,7 +181,11 @@ class TelegramWebDownloader:
                 if request.telegram_scope is TelegramDownloadScope.CHANNEL:
                     return self._run_channel(page, request, output_directory)
                 active_channel: str | None = None
-                for source in request.urls[: request.max_items]:
+                for post_index, source in enumerate(request.urls[: request.max_items], start=1):
+                    check_transfer_active()
+                    if self._progress_callback:
+                        self._progress_callback({'status':'locating', 'post_index':post_index,
+                            'post_total':min(len(request.urls), request.max_items), 'filename':''})
                     source_url = str(source)
                     channel_key, message_id, canonical_url, web_url = parse_telegram_post_url(source_url)
                     if active_channel != channel_key:
@@ -195,6 +222,10 @@ class TelegramWebDownloader:
                     retryable=True,
                 ) from exc
             except Exception as exc:
+                if '45 秒超时' in str(exc):
+                    raise CrawlerError(ErrorCode.DOWNLOAD_FAILED,
+                        'Telegram 媒体分片下载 45 秒超时，已保留完成文件和临时文件，可重试续传。',
+                        retryable=True) from exc
                 raise CrawlerError(
                     ErrorCode.DOWNLOAD_FAILED,
                     f"Telegram Web 下载失败：{type(exc).__name__}。",
@@ -331,7 +362,7 @@ class TelegramWebDownloader:
         maximum_file_bytes: int,
         maximum_total_bytes: int,
     ) -> tuple[dict[str, Any], int, list[str]]:
-        payload = _message_payload(message)
+        payload = _message_payload(page, message)
         text = str(payload.get("text") or "").strip()
         safe_stem = _safe_stem(f"Telegram-{channel_key}-{message_id}")
         files: list[str] = []
@@ -348,8 +379,17 @@ class TelegramWebDownloader:
             files.append(str(text_path))
 
         media_sources: list[dict[str, str]] = list(payload.get("media") or [])
+        unresolved_media = list(payload.get("unresolved_media") or [])
         if request.media_format is MediaFormat.VIDEO:
             media_sources = [item for item in media_sources if item.get("kind") == "video"]
+            unresolved_media = [kind for kind in unresolved_media if kind == "video"]
+        if request.mode is DownloadMode.DOWNLOAD and unresolved_media:
+            kinds = "、".join(sorted(set(str(kind) for kind in unresolved_media)))
+            raise CrawlerError(
+                ErrorCode.DOWNLOAD_FAILED,
+                f"Telegram Web 消息 #{message_id} 的{kinds}媒体未能加载，请保持该消息可见后重试。",
+                retryable=True,
+            )
         for index, media in enumerate(media_sources, start=1):
             if request.mode is not DownloadMode.DOWNLOAD:
                 continue
@@ -358,6 +398,9 @@ class TelegramWebDownloader:
             if not source_value or kind not in {"image", "video"}:
                 continue
             target_base = output_directory / f"{safe_stem}-{index:02d}"
+            if self._progress_callback:
+                self._progress_callback({'status':'preparing', 'filename':str(target_base),
+                    'media_index':index, 'media_total':len(media_sources)})
             path, size = _download_browser_media(
                 page,
                 source_value,
@@ -491,35 +534,41 @@ def _directory_size(path: Path) -> int:
 
 
 def _find_message(page: Page, message_id: str, request: DownloadInput):
-    selector = f'.Message.message-list-item[data-message-id="{message_id}"]'
-    message = page.locator(selector).first
-    target_id = int(message_id)
-    for _ in range(101):
-        if message.count() and message.is_visible(timeout=300):
-            return message
-        message_list = page.locator(".MessageList").first
-        if not message_list.count():
-            break
-        visible_ids = page.locator(
-            ".Message.message-list-item[data-message-id]"
-        ).evaluate_all(
-            "nodes => nodes.map(node => Number(node.getAttribute('data-message-id'))).filter(Number.isFinite)"
-        )
-        if visible_ids and target_id > max(visible_ids):
-            delta = 1_400
-        else:
-            delta = -1_400
-        message_list.evaluate("(node, amount) => node.scrollBy(0, amount)", delta)
-        page.wait_for_timeout(min(1_000, int(request.request_timeout_seconds * 100)))
-    raise CrawlerError(
-        ErrorCode.DOWNLOAD_FAILED,
-        f"Telegram Web 当前频道中没有加载到消息 #{message_id}，请先在频道中定位该消息后重试。",
-        retryable=True,
-    )
+    return find_message(page, message_id, timeout_seconds=request.request_timeout_seconds)
 
 
-def _message_payload(message: Any) -> dict[str, Any]:
-    return message.evaluate(
+def _message_payload(page: Page, message: Any) -> dict[str, Any]:
+    """Hydrate Telegram Web A canvas placeholders before reading sources."""
+    containers = message.locator(".media-inner")
+    unresolved_media: list[str] = []
+    for index in range(containers.count()):
+        container = containers.nth(index)
+        is_video = False
+        try:
+            is_video = bool(
+                container.locator(
+                    "video, .message-media-duration, .icon-large-play, [class*='video']"
+                ).count()
+            )
+            kind = "video" if is_video else "image"
+            source_selector = (
+                "video[src]"
+                if is_video
+                else "img.full-media[src], img[src^='blob:']"
+            )
+            if not container.locator(source_selector).count():
+                container.scroll_into_view_if_needed(timeout=2_000)
+                container.click(timeout=3_000, force=True)
+                container.locator(source_selector).first.wait_for(
+                    state="attached", timeout=8_000
+                )
+                page.wait_for_timeout(100)
+            if not container.locator(source_selector).count():
+                unresolved_media.append(kind)
+        except Exception:
+            unresolved_media.append("video" if is_video else "image")
+
+    payload = message.evaluate(
         r"""
         (node) => {
           const text = node.querySelector('.text-content')?.textContent?.trim() ||
@@ -539,6 +588,9 @@ def _message_payload(message: Any) -> dict[str, Any]:
         }
         """
     )
+    payload = dict(payload or {})
+    payload["unresolved_media"] = unresolved_media
+    return payload
 
 
 def _download_browser_media(
@@ -553,9 +605,14 @@ def _download_browser_media(
 ) -> tuple[Path, int]:
     first = _fetch_browser_chunk(page, source_url, 0 if kind == "video" else None)
     mime = str(first.get("mime") or "").split(";", 1)[0].lower()
-    total = _response_total(first)
+    first_size = len(base64.b64decode(str(first.get("data") or "")))
+    # A Telegram image blob is fetched in full. Chromium can retain the
+    # backing response's Content-Length (occasionally that of a very large
+    # album/video) on the blob response, so the decoded body is authoritative.
+    # Videos are range-fetched and still need Content-Range for their total.
+    total = _response_total(first) if kind == "video" else first_size
     if total is None:
-        total = len(base64.b64decode(str(first.get("data") or "")))
+        total = first_size
     if total > maximum_file_bytes or total > maximum_total_bytes:
         raise CrawlerError(
             ErrorCode.LIMIT_EXCEEDED,
@@ -564,14 +621,30 @@ def _download_browser_media(
     extension = _media_extension(kind, mime)
     target = target_base.with_suffix(extension)
     partial = target.with_suffix(f"{extension}.part")
+    if target.is_file() and target.stat().st_size == total:
+        return target, total
     written = 0
+    # Resume only the exact message/asset path after checking its current size.
+    if kind == 'video' and partial.is_file() and partial.stat().st_size <= total:
+        written = partial.stat().st_size
     try:
-        with partial.open("wb") as stream:
-            response = first
+        with partial.open("ab" if written else "wb") as stream:
+            response = _fetch_browser_chunk(page, source_url, written) if written and written < total else first
+            if written == total:
+                response = {'data':''}
             while True:
+                check_transfer_active()
                 chunk = base64.b64decode(str(response.get("data") or ""))
                 if not chunk:
                     break
+                if kind == 'video':
+                    match = _CONTENT_RANGE.fullmatch(str(response.get('contentRange') or '').strip())
+                    if match and int(match.group(1)) != written:
+                        raise CrawlerError(ErrorCode.DOWNLOAD_FAILED, 'Telegram 分片偏移不匹配，已保留临时文件。')
+                    if written and not match:
+                        raise CrawlerError(ErrorCode.DOWNLOAD_FAILED, 'Telegram 续传响应缺少分片范围，已停止以防文件损坏。')
+                if written + len(chunk) > total:
+                    raise CrawlerError(ErrorCode.DOWNLOAD_FAILED, 'Telegram 分片超出声明大小。')
                 stream.write(chunk)
                 written += len(chunk)
                 if progress_callback is not None:
@@ -593,17 +666,22 @@ def _download_browser_media(
                 retryable=True,
             )
         partial.replace(target)
-    finally:
-        partial.unlink(missing_ok=True)
+    except Exception:
+        # Keep the .part file for a later bounded resume instead of erasing it.
+        raise
     return target, written
 
 
 def _fetch_browser_chunk(page: Page, source_url: str, start: int | None) -> dict[str, Any]:
+    check_transfer_active()
     return page.evaluate(
         r"""
         async ({url, start, chunkSize}) => {
           const headers = start === null ? {} : {Range: `bytes=${start}-${start + chunkSize - 1}`};
-          const response = await fetch(url, {headers, credentials: 'include'});
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 45000);
+          try {
+          const response = await fetch(url, {headers, credentials: 'include', signal: controller.signal});
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const bytes = new Uint8Array(await response.arrayBuffer());
           let binary = '';
@@ -617,6 +695,10 @@ def _fetch_browser_chunk(page: Page, source_url: str, start: int | None) -> dict
             contentRange: response.headers.get('content-range') || '',
             contentLength: response.headers.get('content-length') || '',
           };
+          } catch (error) {
+            if (controller.signal.aborted) throw new Error('Telegram 媒体分片下载 45 秒超时，临时文件已保留，可重试续传。');
+            throw error;
+          } finally { clearTimeout(timer); }
         }
         """,
         {"url": source_url, "start": start, "chunkSize": _FETCH_CHUNK_BYTES},

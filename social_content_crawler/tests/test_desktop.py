@@ -76,6 +76,9 @@ def test_existing_sessions_are_managed_in_a_separate_dialog(tmp_path: Path) -> N
     assert dialog.registered_list.count() == 0
     assert not dialog.empty_label.isHidden()
     assert dialog.register_new_button.text() == "注册新窗口"
+    assert dialog.auto_register_button.text() == "自动发现并注册"
+    assert dialog.api_url_input.text() == "http://127.0.0.1:54345"
+    assert dialog.api_url_input.height() == dialog.auto_register_button.height() == 48
     assert not dialog.remove_button.isEnabled()
     dialog.close()
     app.processEvents()

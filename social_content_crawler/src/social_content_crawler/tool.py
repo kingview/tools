@@ -130,7 +130,7 @@ class SocialMediaDownloadTool:
             return output
         except CrawlerError as exc:
             error = exc
-            if output_directory is not None and request.telegram_scope is not TelegramDownloadScope.CHANNEL:
+            if output_directory is not None and not (request.session_ref or '').startswith('sess_telegram_') and request.telegram_scope is not TelegramDownloadScope.CHANNEL:
                 shutil.rmtree(output_directory, ignore_errors=True)
             raise
         except Exception as exc:
@@ -139,7 +139,7 @@ class SocialMediaDownloadTool:
                 "unexpected downloader failure",
                 retryable=False,
             )
-            if output_directory is not None and request.telegram_scope is not TelegramDownloadScope.CHANNEL:
+            if output_directory is not None and not (request.session_ref or '').startswith('sess_telegram_') and request.telegram_scope is not TelegramDownloadScope.CHANNEL:
                 shutil.rmtree(output_directory, ignore_errors=True)
             raise error from exc
         finally:
@@ -180,6 +180,16 @@ class SocialMediaDownloadTool:
             )
             stable_hash = hashlib.sha256(stable_payload.encode()).hexdigest()[:24]
             invocation = f"telegram-channel-{stable_hash}"
+        elif (request.session_ref or '').startswith('sess_telegram_'):
+            invocation = f'telegram-messages-{input_hash[:24]}'
+            # Older releases used a random suffix. Reuse only this exact
+            # request-hash prefix within the same tenant, never scan by title.
+            tenant_root = self._output_root / tenant
+            legacy = [path for path in tenant_root.glob(f'{input_hash[:12]}-*')
+                      if path.is_dir() and not path.is_symlink()
+                      and re.fullmatch(re.escape(input_hash[:12]) + r'-[a-f0-9]{12}', path.name)]
+            if legacy:
+                invocation = max(legacy, key=lambda path:path.stat().st_mtime).name
         else:
             invocation = f"{input_hash[:12]}-{uuid.uuid4().hex[:12]}"
         destination = (self._output_root / tenant / invocation).resolve()
@@ -187,7 +197,7 @@ class SocialMediaDownloadTool:
             raise CrawlerError(ErrorCode.CONFIGURATION_ERROR, "unsafe output directory")
         destination.mkdir(
             parents=True,
-            exist_ok=request.telegram_scope is TelegramDownloadScope.CHANNEL,
+            exist_ok=request.telegram_scope is TelegramDownloadScope.CHANNEL or (request.session_ref or '').startswith('sess_telegram_'),
         )
         return destination
 

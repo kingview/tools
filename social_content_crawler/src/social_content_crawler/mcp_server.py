@@ -4,9 +4,10 @@ from .diagnostics import current_context, install_exception_hooks
 from .diagnostic_mcp import DiagnosticFastMCP
 
 import os
+import asyncio
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 from .backend import YtDlpBackend
@@ -23,6 +24,7 @@ from .profile_tasks import ProfileTaskCoordinator
 from .runtime import InMemoryAuditSink, LocalRateLimiter
 from .sessions import SessionRegistry
 from .tool import SocialMediaDownloadTool
+from .transfer_progress import report_transfer, transfer_scope
 from .url_policy import PublicHttpsUrlPolicy
 from .x_publish import XPublishBackend
 from .x_publish_contracts import XPublishInput
@@ -67,6 +69,7 @@ class Runtime:
             backend=YtDlpBackend(
                 session_registry=registry,
                 task_coordinator=task_coordinator,
+                progress_callback=report_transfer,
             ),
             audit_sink=audit,
             rate_limiter=limiter,
@@ -110,10 +113,10 @@ def runtime() -> Runtime:
 
 @mcp.tool()
 async def browse_posts(
-    platform: str,
+    platform: Literal['douyin', 'xiaohongshu', 'x', 'telegram'],
     session_ref: str,
-    source: str = "search",
-    view: str = "top",
+    source: Literal['search', 'user', 'timeline', 'url'] = "search",
+    view: Literal['top', 'latest', 'media', 'posts', 'replies', 'users'] = "top",
     query: str | None = None,
     user_key: str | None = None,
     start_url: str | None = None,
@@ -123,6 +126,8 @@ async def browse_posts(
     """Browse posts. For Douyin search, view must be top, media, or users
     (not posts). For Douyin user browsing use posts; timeline/url use top.
     query is required for search. session_ref must match the platform.
+    Telegram only supports source=url/user and view=latest/media/posts.
+    This tool reads current content, not historical tasks; source=resume does not exist.
     """
     request = BrowsePostsInput(**locals())
     result = await runtime().browse.execute(request, runtime().context())
@@ -170,8 +175,31 @@ async def download_media(
         telegram_scope=telegram_scope,
         telegram_max_messages=telegram_max_messages,
     )
-    result = await runtime().download.execute(request, runtime().context())
+    with transfer_scope():
+        result = await runtime().download.execute(request, runtime().context())
     return result.model_dump(mode="json")
+
+
+@mcp.tool()
+async def discover_public_materials(options: dict[str, Any]) -> dict[str, Any]:
+    """Discover filtered links in a fresh anonymous Chrome; no session is read."""
+    from .public_materials import DiscoveryInput, discover
+    return await asyncio.to_thread(discover, DiscoveryInput.model_validate(options), runtime().output_root)
+
+
+@mcp.tool()
+async def download_public_material(url: str, max_total_size_mb: int = 1000) -> dict[str, Any]:
+    """Download one public post and its text without login. Telegram requires a message URL."""
+    from urllib.parse import urlsplit
+    if not 1 <= max_total_size_mb <= 1000:
+        raise ValueError('单次下载上限必须为 1..1000 MB')
+    with transfer_scope():
+        if urlsplit(url).hostname in {'t.me', 'telegram.me'}:
+            from .public_materials import download_telegram
+            return await asyncio.to_thread(download_telegram, url, runtime().output_root, max_total_size_mb*1024*1024)
+        result = await runtime().download.execute(DownloadInput(urls=[url], max_items=1,
+            max_total_size_mb=max_total_size_mb), runtime().context())
+        return result.model_dump(mode='json')
 
 
 @mcp.tool()

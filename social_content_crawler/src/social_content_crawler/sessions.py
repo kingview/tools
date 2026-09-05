@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -10,9 +11,10 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any, Callable, Iterator
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from playwright.sync_api import sync_playwright
 
@@ -56,6 +58,15 @@ _AUTH_COOKIE_ANY = {
 class BrowserProfile:
     profile_id: str
     name: str
+
+
+@dataclass(frozen=True, slots=True)
+class AutoRegistrationReport:
+    discovered: int
+    registered: tuple[SessionRecord, ...]
+    existing: tuple[SessionRecord, ...]
+    unmatched: tuple[BrowserProfile, ...]
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +124,19 @@ class BitBrowserClient:
                 continue
             name = str(item.get("name") or item.get("browserName") or profile_id).strip()
             profiles.append(BrowserProfile(profile_id=profile_id, name=name or profile_id))
+        return profiles
+
+    def list_all_profiles(self, *, max_pages: int = 20) -> list[BrowserProfile]:
+        profiles: list[BrowserProfile] = []
+        seen: set[str] = set()
+        for page in range(max_pages):
+            batch = self.list_profiles(page=page, page_size=100)
+            for profile in batch:
+                if profile.profile_id not in seen:
+                    profiles.append(profile)
+                    seen.add(profile.profile_id)
+            if len(batch) < 100:
+                break
         return profiles
 
     def profile_detail(self, profile_id: str) -> dict[str, Any]:
@@ -211,12 +235,16 @@ class BitBrowserClient:
                 method="POST",
             )
             try:
-                with urlopen(request, timeout=self._timeout_seconds) as stream:
+                # The API is validated as loopback. Never send local browser
+                # control traffic through environment/macOS proxy settings.
+                timeout = max(self._timeout_seconds, 30.0) if path == "/browser/open" else self._timeout_seconds
+                with build_opener(ProxyHandler({})).open(request, timeout=timeout) as stream:
                     response = json.loads(stream.read().decode("utf-8"))
             except (OSError, ValueError) as exc:
                 raise CrawlerError(
                     ErrorCode.PLATFORM_UNAVAILABLE,
-                    "无法连接比特浏览器本地 API。请启动比特浏览器，并检查系统设置中的 API 地址。",
+                    f"比特浏览器本地 API {path} 请求失败或超时。"
+                    "请检查本地 API 的响应；浏览器窗口已打开不代表 API 已就绪。",
                     retryable=True,
                 ) from exc
         if not isinstance(response, dict):
@@ -279,6 +307,57 @@ class SessionRegistry:
 
     def register_bitbrowser_x(self, api_url: str, profile_id: str) -> SessionRecord:
         return self.register_bitbrowser(X_PLATFORM, api_url, profile_id)
+
+    def auto_register_named_profiles(self, api_url: str) -> AutoRegistrationReport:
+        """Register logged-in Profiles whose names begin with a platform marker."""
+        client = self._client_factory(validate_loopback_api_url(api_url))
+        client.health()
+        profiles = client.list_all_profiles()
+        existing_records = self.list()
+        registered: list[SessionRecord] = []
+        existing: list[SessionRecord] = []
+        unmatched: list[BrowserProfile] = []
+        errors: list[str] = []
+        for profile in profiles:
+            platform = platform_from_profile_name(profile.name)
+            if platform is None:
+                unmatched.append(profile)
+                continue
+            same_profile = [
+                item
+                for item in existing_records
+                if item.provider == BITBROWSER_PROVIDER
+                and item.api_url == client.api_url
+                and item.profile_id == profile.profile_id
+            ]
+            current = next(
+                (item for item in same_profile if item.platform == platform), None
+            )
+            if current is not None:
+                existing.append(current)
+                continue
+            if same_profile:
+                conflicting = same_profile[0]
+                if conflicting.platform != platform:
+                    errors.append(
+                        f"{profile.name}：名称识别为 {_PLATFORM_LABEL[platform]}，"
+                        f"但已注册为 {_PLATFORM_LABEL[conflicting.platform]}"
+                    )
+                continue
+            try:
+                record = self.register_bitbrowser(platform, client.api_url, profile.profile_id)
+            except (CrawlerError, OSError) as exc:
+                errors.append(f"{profile.name}：{exc}")
+                continue
+            registered.append(record)
+            existing_records.append(record)
+        return AutoRegistrationReport(
+            discovered=len(profiles),
+            registered=tuple(registered),
+            existing=tuple(existing),
+            unmatched=tuple(unmatched),
+            errors=tuple(errors),
+        )
 
     def list(self) -> list[SessionRecord]:
         with self._lock:
@@ -454,6 +533,22 @@ def validate_session_platform(value: str) -> str:
     return platform
 
 
+def platform_from_profile_name(name: str) -> str | None:
+    """Infer a platform only from an explicit prefix, never from a loose substring."""
+    candidate = name.strip().lstrip("[【(").strip()
+    separator = r"(?=$|[\s\-_:：|/\]】)])"
+    rules = (
+        (XIAOHONGSHU_PLATFORM, rf"^(?:xhs|xiaohongshu|小红书|红书){separator}"),
+        (DOUYIN_PLATFORM, rf"^(?:dy|douyin|抖音){separator}"),
+        (TELEGRAM_PLATFORM, rf"^(?:tg|telegram|电报){separator}"),
+        (X_PLATFORM, rf"^(?:x|twitter){separator}"),
+    )
+    for platform, pattern in rules:
+        if re.search(pattern, candidate, re.IGNORECASE):
+            return platform
+    return None
+
+
 def validate_loopback_cdp_endpoint(value: str) -> str:
     candidate = value.strip()
     parsed = urlsplit(candidate)
@@ -540,43 +635,160 @@ def _validate_profile_login(
 
 
 def _require_telegram_web_login(cdp_endpoint: str) -> None:
-    """Validate Telegram Web through its live UI, never through exported auth."""
+    """Validate Telegram Web through its live UI, never through exported auth.
+
+    A newly opened BitBrowser window exposes its CDP endpoint before Telegram
+    has restored and mounted the logged-in application.  Treat that interval as
+    loading instead of immediately declaring the session invalid.
+    """
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(cdp_endpoint, timeout=30_000)
-        if not browser.contexts:
-            raise CrawlerError(
-                ErrorCode.PLATFORM_UNAVAILABLE,
-                "比特浏览器窗口没有可用的浏览上下文。",
-                retryable=True,
-            )
-        pages = [
-            page
-            for page in browser.contexts[0].pages
-            if not page.is_closed()
-            and (urlsplit(page.url).hostname or "").lower() == "web.telegram.org"
-        ]
-        if not pages:
-            raise CrawlerError(
-                ErrorCode.SESSION_REAUTH_REQUIRED,
-                "该 Profile 中没有打开已登录的 Telegram Web。"
-                "请先在比特浏览器中打开 web.telegram.org 并登录，再重新注册。",
-            )
-        page = pages[-1]
-        page.wait_for_timeout(500)
-        logged_in_selectors = (
-            ".MessageList, .chat-list, #LeftColumn, "
-            "[class*='ChatList'], [class*='MessageList']"
+        _wait_for_telegram_web_login(browser)
+
+
+_TELEGRAM_LOGGED_IN_SELECTORS = (
+    "#LeftColumn .chat-list",
+    "#LeftColumn [class*='ChatList']",
+    "#MiddleColumn .MessageList",
+    ".chat-list",
+    ".MessageList",
+)
+_TELEGRAM_LOGGED_OUT_SELECTORS = (
+    "#auth-pages",
+    ".auth-form",
+    "input[type='tel']",
+    "input[name='phone_number']",
+    ".qr-container",
+)
+
+
+def _wait_for_telegram_web_login(
+    browser: Any,
+    *,
+    timeout_seconds: float = 45.0,
+    poll_interval_seconds: float = 0.25,
+) -> None:
+    deadline = monotonic() + max(timeout_seconds, 0.0)
+    saw_context = False
+    saw_telegram_page = False
+    last_states: list[str] = []
+    loading_since: dict[int, float] = {}
+    recovered_pages: set[int] = set()
+    while True:
+        contexts = list(getattr(browser, "contexts", ()) or ())
+        saw_context = saw_context or bool(contexts)
+        last_states = []
+        for context in contexts:
+            for page in list(getattr(context, "pages", ()) or ()):
+                state = _telegram_web_login_state(page)
+                if state is None:
+                    continue
+                saw_telegram_page = True
+                last_states.append(state)
+                if state == "logged_in":
+                    return
+                page_key = id(page)
+                if state == "loading":
+                    since = loading_since.setdefault(page_key, monotonic())
+                    if (monotonic() - since >= 5 and page_key not in recovered_pages
+                            and deadline - monotonic() > 1 and _telegram_blank_loading(page)):
+                        # A restored tab can remain stuck at redirect.js before
+                        # body exists. Reload only this uninitialized document,
+                        # once; never reload a chat, draft, or login form.
+                        recovered_pages.add(page_key)
+                        try:
+                            page.reload(wait_until="commit", timeout=min(10_000, (deadline - monotonic()) * 1000))
+                        except Exception as exc:
+                            from .diagnostics import record_exception
+                            record_exception("social-content", "telegram.blank_page_recovery", exc)
+                else:
+                    loading_since.pop(page_key, None)
+        if monotonic() >= deadline:
+            break
+        # Pump Playwright's event loop so restored tabs can appear in pages.
+        pages = [page for context in contexts for page in list(getattr(context, "pages", ()) or ())]
+        waiter = next((getattr(page, "wait_for_timeout", None) for page in pages
+                       if callable(getattr(page, "wait_for_timeout", None))), None)
+        interval = min(max(poll_interval_seconds, 0.01), max(deadline - monotonic(), 0))
+        if waiter:
+            try:
+                waiter(interval * 1000)
+            except Exception:
+                sleep(interval)
+        else:
+            sleep(interval)
+
+    if not saw_context:
+        raise CrawlerError(
+            ErrorCode.PLATFORM_UNAVAILABLE,
+            "比特浏览器窗口没有可用的浏览上下文。",
+            retryable=True,
         )
+    if not saw_telegram_page:
+        raise CrawlerError(
+            ErrorCode.PLATFORM_UNAVAILABLE,
+            "已连接比特浏览器，但等待后仍未发现 Telegram Web 标签。"
+            "请检查对应窗口的标签恢复状态，不需要重新注册会话。",
+            retryable=True,
+        )
+    if not last_states or any(state != "logged_out" for state in last_states):
+        raise CrawlerError(
+            ErrorCode.PLATFORM_UNAVAILABLE,
+            "Telegram Web 标签已打开，但页面在等待期限内仍未加载出聊天界面或登录表单。"
+            "这是页面加载未完成，不能判定登录失效；请检查该窗口访问 Telegram 的网络/代理，"
+            "待页面加载完成后重试，无需重新注册。"
+            f"（页面状态：{','.join(last_states) or '标签已关闭'}）",
+            retryable=True,
+        )
+    raise CrawlerError(
+        ErrorCode.SESSION_REAUTH_REQUIRED,
+        "Telegram Web 当前显示登录界面。请在对应比特浏览器窗口手动登录后重试，"
+        "无需重新注册会话。",
+    )
+
+
+def _telegram_web_login_state(page: Any) -> str | None:
+    try:
+        if page.is_closed():
+            return None
+        host = (urlsplit(page.url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return None
+    if host != "web.telegram.org":
+        return None
+    if _telegram_any_visible(page, _TELEGRAM_LOGGED_OUT_SELECTORS):
+        return "logged_out"
+    if _telegram_any_visible(page, _TELEGRAM_LOGGED_IN_SELECTORS):
+        return "logged_in"
+    # Web A hides the chat list while some panes/viewers are active.  The two
+    # mounted application columns are still a reliable authenticated-shell
+    # signal, whereas the signed-out screen uses the separate auth root above.
+    if _telegram_any_visible(page, ("#LeftColumn",)) and _telegram_any_visible(
+        page, ("#MiddleColumn",)
+    ):
+        return "logged_in"
+    return "loading"
+
+
+def _telegram_blank_loading(page: Any) -> bool:
+    try:
+        return bool(page.evaluate("document.readyState === 'loading' && document.body === null"))
+    except Exception:
+        return False
+
+
+def _telegram_any_visible(page: Any, selectors: tuple[str, ...]) -> bool:
+    for selector in selectors:
         try:
-            logged_in = page.locator(logged_in_selectors).first.is_visible(timeout=2_000)
+            locator = page.locator(selector)
+            for index in range(locator.count()):
+                if locator.nth(index).is_visible(timeout=150):
+                    return True
         except Exception:
-            logged_in = False
-        if not logged_in:
-            raise CrawlerError(
-                ErrorCode.SESSION_REAUTH_REQUIRED,
-                "该 Profile 中没有检测到有效的 Telegram Web 登录会话。"
-                "请先在比特浏览器中手动登录 Telegram Web，再重新注册。",
-            )
+            # Telegram can replace its root tree while restoring the session;
+            # a detached locator is a loading signal, not a logged-out signal.
+            continue
+    return False
 
 
 def _read_live_profile_cookies(cdp_endpoint: str) -> list[dict[str, Any]]:

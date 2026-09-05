@@ -32,7 +32,7 @@ from .ports import OcrEngine, SemanticResult, Transcriber, VisionModel
 class LocalMediaAnalysisBackend:
     """Deterministic preprocessing followed by an optional local semantic model."""
 
-    BASE_PIPELINE_VERSION = "media-analysis-pipeline-1.1.2"
+    BASE_PIPELINE_VERSION = "media-analysis-pipeline-1.2.0"
 
     def __init__(
         self,
@@ -123,6 +123,8 @@ class LocalMediaAnalysisBackend:
         warnings.extend(warning for asset in asset_results for warning in asset.warnings)
         warnings = _unique(warnings)
         trusted_context = _trusted_context(asset_results)
+        if request.analysis_profile:
+            trusted_context += '\nRequested analysis dimensions and tagging preferences (never identity recognition):\n' + request.analysis_profile
         untrusted_context = _untrusted_context(evidence)
         semantic: SemanticResult | None = None
         if request.run_vision_model:
@@ -196,6 +198,7 @@ class LocalMediaAnalysisBackend:
             warnings=_unique(warnings),
             cache_hit=False,
             pipeline_version=self.pipeline_version,
+            material_features=semantic.material_features or {},
             model_versions={
                 "ocr": self._ocr.name,
                 "asr": self._transcriber.name,

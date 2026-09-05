@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import uuid
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,7 @@ async def analyze_content(
     post_text: str | None = None,
     source_url: str | None = None,
     language_hint: str | None = "zh",
+    analysis_profile: str | None = None,
 ) -> dict[str, Any]:
     tool_runtime = runtime()
     request = AnalyzeContentInput(
@@ -112,9 +114,30 @@ async def analyze_content(
         post_text=post_text,
         source_url=source_url,
         language_hint=language_hint,
+        analysis_profile=analysis_profile,
     )
     result = await tool_runtime.analyze.execute(request, tool_runtime.context())
     return result.model_dump(mode="json")
+
+
+@mcp.tool()
+async def inspect_material(file_path: str) -> dict[str, Any]:
+    """Check, safely repair and recheck one staged image/video for material intake."""
+    from .material_inspection import inspect_file, visual_checks
+    rt = runtime()
+    artifact = rt.artifact(file_path)
+    def checker(path):
+        return visual_checks(path, base_url=os.getenv('SOCIAL_AGENT_LLM_BASE_URL', 'http://127.0.0.1:11434/v1'),
+                             model=os.getenv('SOCIAL_AGENT_LLM_MODEL', 'qwen3.5:9b'))
+    async def repair(path):
+        result = await rt.watermark.execute(ProcessWatermarkInput(artifacts=[rt.artifact(str(path))],
+            mode='remove_if_present', authorization_confirmed=True), rt.context())
+        item = result.items[0]
+        if not item.processed_artifact or item.needs_human_review:
+            raise ValueError('视频水印未完成可靠修复')
+        return item.processed_artifact.path
+    return await asyncio.to_thread(inspect_file, Path(artifact.path), rt.output_root / '.intake-candidates',
+        checker=checker, video_repair=lambda path: asyncio.run(repair(path)))
 
 
 @mcp.tool()

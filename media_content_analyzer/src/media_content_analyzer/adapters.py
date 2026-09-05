@@ -188,6 +188,7 @@ class _SemanticPayload(BaseModel):
     safety_flags: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.5, ge=0, le=1)
     evidence_refs: list[str] = Field(default_factory=list)
+    material_features: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -300,7 +301,12 @@ class OpenAICompatibleVisionModel:
                     "commercial_intent, safety_flags, confidence, evidence_refs. "
                     "topics, entities, claims, safety_flags, and evidence_refs MUST each "
                     "be an array of strings, never an array of objects. confidence MUST "
-                    "be a numeric value from 0.0 to 1.0, never text such as high or 高."
+                    "be a numeric value from 0.0 to 1.0, never text such as high or 高. "
+                    "Also return material_features: quality (numeric 0..100 based on actual "
+                    "readability/clarity), topic, language, format, audience, style, timeliness, "
+                    "portrait (arrays of descriptive strings). Omit unknown dimensions. "
+                    "Describe visible people only as present/absent; never identify a person "
+                    "or infer identity matches across images."
                 ),
             }
         ]

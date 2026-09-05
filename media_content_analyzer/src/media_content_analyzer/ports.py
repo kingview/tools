@@ -74,6 +74,7 @@ class SemanticResult:
     safety_flags: list[str]
     confidence: float
     evidence_refs: list[str]
+    material_features: dict | None = None
 
 
 class VisionModel(Protocol):

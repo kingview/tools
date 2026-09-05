@@ -10,9 +10,11 @@ import pytest
 import social_content_crawler.sessions as sessions_module
 from social_content_crawler.errors import CrawlerError, ErrorCode
 from social_content_crawler.sessions import (
+    BrowserProfile,
     BitBrowserClient,
     SessionRegistry,
     _proxy_url_from_profile_detail,
+    platform_from_profile_name,
     validate_loopback_api_url,
 )
 
@@ -88,6 +90,89 @@ def test_bitbrowser_client_lists_profiles() -> None:
     client.health()
     assert client.list_profiles()[0].profile_id == PROFILE_ID
     assert client.open_profile(PROFILE_ID).startswith("ws://127.0.0.1:50106/")
+
+
+def test_bitbrowser_client_lists_all_profile_pages() -> None:
+    pages = []
+
+    def transport(path: str, payload: dict):
+        assert path == "/browser/list"
+        pages.append(payload["page"])
+        start = payload["page"] * 100
+        count = 100 if payload["page"] == 0 else 2
+        return {
+            "success": True,
+            "data": {
+                "list": [
+                    {"id": f"profile-{index}", "name": f"DY-素材-{index:03d}"}
+                    for index in range(start, start + count)
+                ]
+            },
+        }
+
+    client = BitBrowserClient("http://127.0.0.1:54345", transport=transport)
+    profiles = client.list_all_profiles()
+    assert len(profiles) == 102
+    assert pages == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("name", "platform"),
+    [
+        ("DY-素材-01", "douyin"),
+        ("抖音_直播 02", "douyin"),
+        ("XHS-美女-01", "xiaohongshu"),
+        ("【小红书】品牌账号", "xiaohongshu"),
+        ("X-发布-01", "x"),
+        ("Twitter 工作账号", "x"),
+        ("TG-频道-01", "telegram"),
+        ("Telegram: 新闻", "telegram"),
+        ("Xavier 的普通窗口", None),
+        ("素材-X-01", None),
+        ("未分类窗口", None),
+    ],
+)
+def test_profile_name_platform_rules_are_explicit(name: str, platform: str | None) -> None:
+    assert platform_from_profile_name(name) == platform
+
+
+def test_auto_registers_named_profiles_without_rotating_existing_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profiles = [
+        BrowserProfile("dy-1", "DY-素材-01"),
+        BrowserProfile("xhs-1", "小红书-品牌-01"),
+        BrowserProfile("x-1", "X-发布-01"),
+        BrowserProfile("tg-1", "TG-频道-01"),
+        BrowserProfile("other", "普通窗口"),
+    ]
+
+    class FakeClient:
+        def __init__(self, api_url):
+            self.api_url = validate_loopback_api_url(api_url)
+
+        def health(self):
+            pass
+
+        def list_all_profiles(self):
+            return profiles
+
+        def profile_detail(self, profile_id):
+            profile = next(item for item in profiles if item.profile_id == profile_id)
+            return {"name": profile.name}
+
+    monkeypatch.setattr(sessions_module, "_validate_profile_login", lambda *_args: None)
+    registry = SessionRegistry(tmp_path / "sessions.json", client_factory=FakeClient)
+    existing = registry.register_bitbrowser("douyin", "http://127.0.0.1:54345", "dy-1")
+
+    report = registry.auto_register_named_profiles("http://127.0.0.1:54345")
+
+    assert report.discovered == 5
+    assert [item.session_ref for item in report.existing] == [existing.session_ref]
+    assert {item.platform for item in report.registered} == {"xiaohongshu", "x", "telegram"}
+    assert [item.name for item in report.unmatched] == ["普通窗口"]
+    assert report.errors == ()
+    assert len(registry.list()) == 4
 
 
 def test_bitbrowser_client_reuses_running_profile_without_opening_again() -> None:
@@ -343,3 +428,182 @@ def test_registers_telegram_from_live_web_session_without_exporting_auth(
     assert registry.validate_session(record.session_ref, "telegram") == record
     stored = registry.path.read_text(encoding="utf-8")
     assert "secret-auth-token" not in stored
+
+
+class _TelegramLocator:
+    def __init__(self, visible: bool) -> None:
+        self._visible = visible
+
+    @property
+    def first(self):
+        return self
+
+    def count(self) -> int:
+        return int(self._visible)
+
+    def nth(self, index: int):
+        return self
+
+    def is_visible(self, *, timeout: int) -> bool:
+        return self._visible
+
+
+class _TelegramPage:
+    def __init__(
+        self,
+        *,
+        ready_after: int | None = 1,
+        logged_out: bool = False,
+        visible_selectors: set[str] | None = None,
+    ) -> None:
+        self.url = "https://web.telegram.org/a/#@example"
+        self.ready_after = ready_after
+        self.logged_out = logged_out
+        self.visible_selectors = visible_selectors or set()
+        self.polls = 0
+
+    def is_closed(self) -> bool:
+        return False
+
+    def locator(self, selector: str) -> _TelegramLocator:
+        if selector == "#auth-pages":
+            self.polls += 1
+        if self.logged_out and selector == "#auth-pages":
+            return _TelegramLocator(True)
+        ready = self.ready_after is not None and self.polls >= self.ready_after
+        return _TelegramLocator(
+            selector in self.visible_selectors or (ready and selector == ".chat-list")
+        )
+
+
+class _TelegramBrowser:
+    def __init__(self, *pages: _TelegramPage) -> None:
+        self.contexts = [type("Context", (), {"pages": list(pages)})()]
+
+
+def test_telegram_login_waits_for_restored_web_app() -> None:
+    page = _TelegramPage(ready_after=3)
+
+    sessions_module._wait_for_telegram_web_login(
+        _TelegramBrowser(page), timeout_seconds=0.2, poll_interval_seconds=0.001
+    )
+
+    assert page.polls >= 3
+
+
+def test_telegram_login_accepts_any_logged_in_tab() -> None:
+    logged_out = _TelegramPage(ready_after=None, logged_out=True)
+    logged_in = _TelegramPage(ready_after=1)
+
+    sessions_module._wait_for_telegram_web_login(
+        _TelegramBrowser(logged_out, logged_in), timeout_seconds=0
+    )
+
+
+def test_telegram_login_accepts_mounted_shell_when_chat_list_is_hidden() -> None:
+    page = _TelegramPage(
+        ready_after=None,
+        visible_selectors={"#LeftColumn", "#MiddleColumn"},
+    )
+
+    sessions_module._wait_for_telegram_web_login(
+        _TelegramBrowser(page), timeout_seconds=0
+    )
+
+
+def test_telegram_login_rejects_explicit_logged_out_page() -> None:
+    with pytest.raises(CrawlerError) as raised:
+        sessions_module._wait_for_telegram_web_login(
+            _TelegramBrowser(_TelegramPage(ready_after=None, logged_out=True)),
+            timeout_seconds=0,
+        )
+
+    assert raised.value.code is ErrorCode.SESSION_REAUTH_REQUIRED
+
+
+def test_telegram_loading_page_is_not_reported_as_logged_out() -> None:
+    with pytest.raises(CrawlerError, match="页面加载未完成") as raised:
+        sessions_module._wait_for_telegram_web_login(
+            _TelegramBrowser(_TelegramPage(ready_after=None)), timeout_seconds=0,
+        )
+    assert raised.value.code is ErrorCode.PLATFORM_UNAVAILABLE
+
+
+def test_telegram_missing_tab_does_not_require_reregistration() -> None:
+    with pytest.raises(CrawlerError, match="未发现 Telegram Web 标签") as raised:
+        sessions_module._wait_for_telegram_web_login(_TelegramBrowser(), timeout_seconds=0)
+    assert raised.value.code is ErrorCode.PLATFORM_UNAVAILABLE
+
+
+def test_telegram_loading_tab_takes_precedence_over_old_login_tab() -> None:
+    with pytest.raises(CrawlerError) as raised:
+        sessions_module._wait_for_telegram_web_login(
+            _TelegramBrowser(_TelegramPage(logged_out=True), _TelegramPage(ready_after=None)),
+            timeout_seconds=0,
+        )
+    assert raised.value.code is ErrorCode.PLATFORM_UNAVAILABLE
+
+
+def test_telegram_wait_pumps_browser_events() -> None:
+    page = _TelegramPage(ready_after=None)
+    def restored(milliseconds):
+        page.ready_after = 1
+    page.wait_for_timeout = restored
+    sessions_module._wait_for_telegram_web_login(
+        _TelegramBrowser(page), timeout_seconds=.1, poll_interval_seconds=.001,
+    )
+
+
+def test_bitbrowser_api_bypasses_proxy_and_waits_longer_for_open(monkeypatch) -> None:
+    calls = []
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return b'{"success":true,"data":{}}'
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(timeout)
+            return Response()
+    def opener(handler):
+        assert handler.proxies == {}
+        return Opener()
+    monkeypatch.setattr(sessions_module, 'build_opener', opener)
+    client = BitBrowserClient('http://127.0.0.1:54345')
+    client._post('/health', {})
+    client._post('/browser/open', {'id':PROFILE_ID})
+    assert calls == [8.0, 30.0]
+
+
+@pytest.mark.parametrize('blank, expected_reloads', [(True, 1), (False, 0)])
+def test_telegram_recovers_only_stalled_blank_tabs(monkeypatch, blank, expected_reloads) -> None:
+    from itertools import count
+    clock = count(0, .5)
+    monkeypatch.setattr(sessions_module, 'monotonic', lambda: next(clock))
+    monkeypatch.setattr(sessions_module, 'sleep', lambda seconds: None)
+    page = _TelegramPage(ready_after=None)
+    page.evaluate = lambda script: blank
+    calls = []
+    def reload(**kwargs):
+        calls.append(kwargs)
+        page.ready_after = 1
+    page.reload = reload
+    if blank:
+        sessions_module._wait_for_telegram_web_login(_TelegramBrowser(page), timeout_seconds=45)
+    else:
+        with pytest.raises(CrawlerError):
+            sessions_module._wait_for_telegram_web_login(_TelegramBrowser(page), timeout_seconds=45)
+    assert len(calls) == expected_reloads
+
+
+def test_telegram_blank_recovery_is_not_repeated(monkeypatch) -> None:
+    from itertools import count
+    clock = count(0, .5)
+    monkeypatch.setattr(sessions_module, 'monotonic', lambda: next(clock))
+    monkeypatch.setattr(sessions_module, 'sleep', lambda seconds: None)
+    page = _TelegramPage(ready_after=None)
+    page.evaluate = lambda script: True
+    calls = []
+    page.reload = lambda **kwargs: calls.append(kwargs)
+    with pytest.raises(CrawlerError):
+        sessions_module._wait_for_telegram_web_login(_TelegramBrowser(page), timeout_seconds=45)
+    assert len(calls) == 1

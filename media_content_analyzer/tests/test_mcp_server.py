@@ -13,6 +13,7 @@ from media_content_analyzer.mcp_server import (
 def test_plugin_mcp_exposes_media_tools() -> None:
     assert set(mcp._tool_manager._tools) == {
         "analyze_content",
+        "inspect_material",
         "process_watermark",
         "generate_post_copy",
     }

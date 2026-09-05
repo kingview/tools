@@ -70,8 +70,8 @@ class BrowsePostsInput(BaseModel):
                 BrowseSource.URL: {BrowseView.TOP},
             },
             BrowsePlatform.TELEGRAM: {
-                BrowseSource.USER: {BrowseView.POSTS},
-                BrowseSource.URL: {BrowseView.POSTS},
+                BrowseSource.USER: {BrowseView.POSTS, BrowseView.MEDIA, BrowseView.LATEST},
+                BrowseSource.URL: {BrowseView.POSTS, BrowseView.MEDIA, BrowseView.LATEST},
             },
         }
         platform_sources = allowed_views[self.platform]

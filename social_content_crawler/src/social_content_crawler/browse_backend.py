@@ -22,6 +22,7 @@ from .errors import CrawlerError, ErrorCode
 from .profile_tasks import GLOBAL_PROFILE_TASK_COORDINATOR, ProfileTaskCoordinator
 from .sessions import BitBrowserClient, SessionRegistry
 from .telegram_web import resolve_telegram_web_url
+from .telegram_dom import MESSAGE_LIST, MESSAGES, message_list, seek_latest
 
 
 _X_POST_PATH = re.compile(r"^/([A-Za-z0-9_]{1,15})/status/(\d+)")
@@ -47,7 +48,7 @@ _POST_SELECTORS = {
     BrowsePlatform.XIAOHONGSHU: (
         'a[href*="/explore/"], a[href*="/discovery/item/"]'
     ),
-    BrowsePlatform.TELEGRAM: ".Message.message-list-item[data-message-id]",
+    BrowsePlatform.TELEGRAM: f"{MESSAGE_LIST} {MESSAGES}",
 }
 _CHALLENGE_SELECTORS = (
     'iframe[src*="captcha" i], iframe[src*="verify" i], '
@@ -130,6 +131,8 @@ class PlaywrightCdpAutomation:
                         wait_timeout_ms=challenge_wait_ms,
                     )
                     _wait_for_initial_posts(page, request)
+                    if request.platform is BrowsePlatform.TELEGRAM:
+                        seek_latest(page, timeout_seconds=request.navigation_timeout_seconds)
                     _raise_if_platform_challenge(
                         page,
                         request.platform,
@@ -152,7 +155,7 @@ class PlaywrightCdpAutomation:
                         if stagnant_rounds >= 3:
                             break
                         if request.platform is BrowsePlatform.TELEGRAM:
-                            page.locator(".MessageList").first.evaluate(
+                            message_list(page).evaluate(
                                 "node => node.scrollBy(0, -1200)"
                             )
                         else:
@@ -546,20 +549,30 @@ def _extract_telegram_rows(page: Page, request: BrowsePostsInput) -> list[dict[s
           const meta = message.querySelector('.MessageMeta')?.textContent?.trim() || null;
           const views = message.querySelector('.MessageMeta .message-views, [class*="views"]')?.textContent?.trim() || meta;
           const media = [...message.querySelectorAll('.media-inner')];
+          const isVideo = (node) => Boolean(node.querySelector(
+            'video, .message-media-duration, .icon-large-play, [class*="video"]'
+          ));
           return {
             message_id: messageId,
             text,
             views,
-            has_image: media.some((node) => Boolean(node.querySelector('img.full-media, img[src^="blob:"]'))),
-            has_video: media.some((node) => Boolean(node.querySelector('video'))),
+            // Telegram Web A initially paints media into low-resolution canvas
+            // placeholders and portals the full image/video into a sibling
+            // layer. Presence of a canvas still means this is a media post.
+            has_image: media.some((node) => !isVideo(node) && Boolean(
+              node.querySelector('img.full-media, img[src^="blob:"], canvas')
+            )),
+            has_video: media.some(isVideo),
           };
         }).filter((row) => /^\d+$/.test(row.message_id || ''))
         """
     )
     prefix, author_id, author_handle = _telegram_post_prefix(request, page.url)
     normalized = []
-    # Telegram renders older messages above newer messages; return newest first.
-    for row in reversed(rows):
+    # DOM order can differ during virtual-list transitions and grouped updates.
+    for row in sorted(rows, key=lambda item: int(item["message_id"]), reverse=True):
+        if request.view is BrowseView.MEDIA and not (row.get("has_image") or row.get("has_video")):
+            continue
         item = dict(row)
         item["url"] = f"{prefix}/{item.pop('message_id')}"
         item["author_id"] = author_id

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "com.socialagent.social-content",
   "name": "社媒浏览与下载",
-  "version": "0.9.14",
+  "version": "0.9.23",
   "description": "通过比特浏览器会话浏览抖音、小红书、X 和 Telegram Web，下载帖子媒体与文本，并在一次性授权后发布 X 帖子。",
   "publisher": "Social Agent",
   "platforms": ["macos-arm64", "windows-x64", "linux-x64"],
@@ -13,6 +13,8 @@
     "install_extras": ["plugin"]
   },
   "tools": [
+    {"name": "discover_public_materials"},
+    {"name": "download_public_material"},
     {"name": "browse_posts"},
     {"name": "browser_operate"},
     {"name": "download_media"},

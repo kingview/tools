@@ -72,6 +72,25 @@ def test_download_normalizes_artifact_and_audits(tmp_path: Path) -> None:
     assert audit.events[0].tool_version == "1.9.2"
 
 
+def test_telegram_failure_keeps_completed_and_partial_files(tmp_path):
+    from social_content_crawler.errors import CrawlerError, ErrorCode
+    tool = _tool(tmp_path, InMemoryAuditSink())
+    class FailingBackend:
+        def run(self, request, output_directory):
+            (output_directory/'done.jpg').write_bytes(b'complete')
+            (output_directory/'pending.mp4.part').write_bytes(b'partial')
+            raise CrawlerError(ErrorCode.DOWNLOAD_FAILED,'timeout')
+    tool._backend = FailingBackend()
+    request = DownloadInput(urls=['https://video.example.com/post/42'],session_ref='sess_telegram_abcdefghijklmnopqrstuvwx')
+    context = ToolContext(tenant_id='local-agent',trace_id='trace-1',actor_type='agent',actor_id='agent')
+    with pytest.raises(CrawlerError):
+        asyncio.run(tool.execute(request, context))
+    directories = list((tmp_path/'local-agent').iterdir())
+    assert len(directories) == 1
+    assert (directories[0]/'done.jpg').read_bytes() == b'complete'
+    assert (directories[0]/'pending.mp4.part').read_bytes() == b'partial'
+
+
 def test_metadata_only_is_dry_run(tmp_path: Path) -> None:
     audit = InMemoryAuditSink()
     result = asyncio.run(

@@ -127,6 +127,7 @@ class AnalyzeContentInput(BaseModel):
     post_text: str | None = Field(default=None, max_length=100_000)
     source_url: HttpUrl | None = None
     language_hint: str | None = Field(default=None, max_length=32)
+    analysis_profile: str | None = Field(default=None, max_length=10000)
 
     generate_summary: bool = True
     generate_tags: bool = True
@@ -232,6 +233,7 @@ class ContentAnalysisOutput(BaseModel):
     cache_hit: bool = False
     pipeline_version: str
     model_versions: dict[str, str]
+    material_features: dict = Field(default_factory=dict)
 
 
 class CopyPlatform(StrEnum):
