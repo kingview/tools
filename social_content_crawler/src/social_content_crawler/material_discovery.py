@@ -126,10 +126,39 @@ def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=
     return state.result(folder)
 
 
-def discover(request, output_root, registry=None, *, checkpoint_key=None, selected_account_url=None):
+def review_page(page, request, folder, *, action):
+    """Inspect the original target without collecting links or solving a challenge."""
+    address, model = source(request)
+    state = DiscoveryState(request)
+    if not DiscoveryJournal(folder).load(state):
+        raise ValueError('没有可恢复的原任务检查点，请重新执行链接发现')
+    if state.selected_account_url:
+        address = state.selected_account_url
+    page.set_default_navigation_timeout(30000)
+    if not _same_navigation_url(page.url, address):
+        page.goto(address, wait_until='domcontentloaded')
+    page.bring_to_front()
+    if action == 'open':
+        return {'needs_human_review': True, 'ready': False, 'reason': '请在此窗口完成人工处理，然后重新检查。'}
+    if model is None:
+        raise ValueError('Telegram 公开频道不进入登录验证流程')
+    access = wait_for_access(page, request, model.platform, DiscoveryDeadline(page, 10),
+        validate_login=_raise_if_login_required, challenge_visible=_platform_challenge_visible, review_wait_seconds=0)
+    if access.ready and not _extract_rows(page, model):
+        return {'needs_human_review': True, 'ready': False,
+                'reason': '页面尚未显示可确认的帖子内容；可能仍在加载、要求登录或没有结果，请检查后再试。'}
+    # Keep the owned page until the subsequent resume consumes it. No cursor,
+    # links, filters or completed results are changed by this inspection.
+    return {'needs_human_review': True, 'ready': access.ready,
+            'reason': access.warning or ('检查通过' if access.ready else access.reason)}
+
+
+def discover(request, output_root, registry=None, *, checkpoint_key=None, selected_account_url=None, review_action=None):
     from playwright.sync_api import sync_playwright
     if checkpoint_key is not None and not re.fullmatch('[a-f0-9]{32}',checkpoint_key):
         raise ValueError('无效采集检查点 ID')
+    if review_action not in {None, 'open', 'check'} or (review_action and (not checkpoint_key or request.platform == 'telegram')):
+        raise ValueError('无效人工检查操作')
     root=Path(output_root).resolve()/'discovered-links'
     folder=root/(checkpoint_key or uuid.uuid4().hex)
     if folder.is_symlink() or not folder.resolve().is_relative_to(Path(output_root).resolve()):
@@ -147,6 +176,8 @@ def discover(request, output_root, registry=None, *, checkpoint_key=None, select
                         yield page
 
             def operation(page, reused):
+                if review_action:
+                    return review_page(page, request, folder, action=review_action)
                 result = collect(page, request, folder, resume=True, resume_current_page=reused,
                                  selected_account_url=selected_account_url)
                 if result['needs_human_review']:
@@ -156,7 +187,8 @@ def discover(request, output_root, registry=None, *, checkpoint_key=None, select
             return RETAINED_DISCOVERY.run((str(folder.resolve()), DiscoveryState(request).fingerprint()), factory, operation)
         with sync_playwright() as playwright:
             with discovery_page(playwright, request, registry) as (page, state):
-                result = collect(page, request, folder, resume=checkpoint_key is not None,
-                                 selected_account_url=selected_account_url)
+                result = (review_page(page, request, folder, action=review_action) if review_action else
+                          collect(page, request, folder, resume=checkpoint_key is not None,
+                                  selected_account_url=selected_account_url))
                 state['keep_for_review'] = result['needs_human_review']
                 return result

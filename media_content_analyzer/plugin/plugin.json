@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "com.socialagent.media-content",
   "name": "媒体内容分析与修复",
-  "version": "0.10.19",
+  "version": "0.10.21",
   "description": "分析图片、音频和视频，生成标签、摘要与文案，并检测和修复视频水印。",
   "publisher": "Social Agent",
   "platforms": ["macos-arm64", "windows-x64", "linux-x64"],

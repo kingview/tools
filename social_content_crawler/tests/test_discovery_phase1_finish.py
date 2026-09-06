@@ -77,7 +77,8 @@ def test_persistent_environment_reuses_private_directory_not_export_or_business_
     with persistent_page(playwright,first) as actual:
         assert actual is page
     context.close.assert_called_once()
-    playwright.chromium.launch_persistent_context.assert_called_once_with(str(first),channel='chrome',headless=False)
+    playwright.chromium.launch_persistent_context.assert_called_once_with(str(first),channel='chrome',headless=False,
+        args=['--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1'])
     assert stat.S_IMODE(first.stat().st_mode)==0o700
     assert first.exists()
 

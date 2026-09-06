@@ -60,3 +60,40 @@ def test_large_mask_does_not_modify_image(tmp_path):
         'watermark_regions':[{'x':0,'y':0,'width':.9,'height':.9}]}
     report=inspect_file(source,tmp_path/'work',checker=checker)
     assert not report['passed'] and source.read_bytes()==before
+
+
+def test_phases_follow_real_repair_and_recheck_and_never_claim_admission(tmp_path):
+    source = picture(tmp_path/'source.png')
+    phases, checks = [], []
+    def checker(path):
+        checks.append(path)
+        if len(checks) == 1:
+            assert phases[-1][0] == '检查中'
+            return {**clean(path), 'watermark_confident': True,
+                    'watermark_regions': [{'x': .8, 'y': .8, 'width': .1, 'height': .1}]}
+        assert phases[-1][0] == '待重新检查'
+        return clean(path)
+    result = inspect_file(source, tmp_path/'work', checker=checker,
+                          on_progress=lambda *args: phases.append(args))
+    assert result['passed']
+    assert [phase[0] for phase in phases] == ['检查中', '处理中', '待重新检查']
+    assert result['found_issues'] == ['检测到水印']
+    assert phases[-1][1:] == (['检测到水印'], ['图片去水印候选已生成'])
+
+
+def test_clean_image_does_not_emit_fake_repair_phases(tmp_path):
+    phases = []
+    assert inspect_file(picture(tmp_path/'source.png'), tmp_path/'work', checker=clean,
+                        on_progress=lambda *args: phases.append(args))['passed']
+    assert [phase[0] for phase in phases] == ['检查中']
+
+
+def test_failed_recheck_retains_repair_evidence(tmp_path):
+    calls = []
+    def checker(path):
+        calls.append(path)
+        return {**clean(path), 'watermark_confident': True,
+                'watermark_regions': [{'x': .8, 'y': .8, 'width': .1, 'height': .1}]}
+    result = inspect_file(picture(tmp_path/'source.png'), tmp_path/'work', checker=checker)
+    assert not result['passed'] and result['actions'] == ['图片去水印候选已生成']
+    assert result['issues'] == ['图片修复后复检未通过']

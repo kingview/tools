@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
-import httpx
+from .material_http import post_json
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contracts import (
@@ -341,12 +341,8 @@ class OpenAICompatibleVisionModel:
                 {"role": "user", "content": user_content},
             ],
         }
-        with httpx.Client(timeout=self._timeout_seconds) as client:
-            response = client.post(
-                f"{self._base_url}/chat/completions", headers=headers, json=payload
-            )
-            response.raise_for_status()
-            body = response.json()
+        body = post_json(f"{self._base_url}/chat/completions", headers=headers,
+                         payload=payload, timeout=self._timeout_seconds)
         raw = body["choices"][0]["message"]["content"]
         if isinstance(raw, list):
             raw = "".join(
@@ -453,12 +449,8 @@ class OpenAICompatibleCopyGenerator:
                 },
             ],
         }
-        with httpx.Client(timeout=self._timeout_seconds) as client:
-            response = client.post(
-                f"{self._base_url}/chat/completions", headers=headers, json=payload
-            )
-            response.raise_for_status()
-            body = response.json()
+        body = post_json(f"{self._base_url}/chat/completions", headers=headers,
+                         payload=payload, timeout=self._timeout_seconds)
         raw = body["choices"][0]["message"]["content"]
         if isinstance(raw, list):
             raw = "".join(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .material_control import MaterialControlInterrupted
+
 from .diagnostics import record_exception
 
 import json
@@ -140,6 +142,8 @@ class LocalMediaAnalysisBackend:
                         untrusted_content=untrusted_context,
                         language_hint=request.language_hint,
                     )
+                except MaterialControlInterrupted:
+                    raise
                 except Exception as exc:
                     record_exception("media-content", "analysis.semantic_fallback", exc)
                     warnings.append(

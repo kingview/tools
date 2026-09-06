@@ -1,15 +1,9 @@
 """Phase-one link discovery; anonymous by default, optional explicit BitBrowser."""
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import httpx
-
-from .url_policy import PublicHttpsUrlPolicy
-from .transfer_progress import report_transfer
 
 
 from .discovery_contract import DiscoveryInput, utc, telegram_address
@@ -73,10 +67,12 @@ def telegram_rows(page):
 from .discovery_journal import export_links
 
 
-def discover(request: DiscoveryInput, output_root: Path, registry=None, *, checkpoint_key=None):
+def discover(request: DiscoveryInput, output_root: Path, registry=None, *, checkpoint_key=None,
+             selected_account_url=None, review_action=None):
     # Retain the public import path for existing plugin callers.
     from .material_discovery import discover as run
-    return run(request, output_root, registry, checkpoint_key=checkpoint_key)
+    return run(request, output_root, registry, checkpoint_key=checkpoint_key,
+               selected_account_url=selected_account_url, review_action=review_action)
 
 
 def download_telegram(url: str, output_root: Path, max_bytes=1000*1024*1024):
@@ -95,55 +91,8 @@ def download_telegram(url: str, output_root: Path, max_bytes=1000*1024*1024):
             browser.close()
     if not posts or not posts[0]['media']:
         raise ValueError('公开页面没有暴露该消息的媒体；不切换到私人或登录会话')
-    post, artifacts, total = posts[0], [], 0
+    post = posts[0]
     (folder / 'metadata.json').write_text(json.dumps(post, ensure_ascii=False, indent=2))
     (folder / 'text.txt').write_text(post.get('text') or '')
-    policy = PublicHttpsUrlPolicy()
-    with httpx.Client(timeout=httpx.Timeout(45, connect=20), follow_redirects=False) as client:
-        for index, media in enumerate(post['media']):
-            target = folder / f'{index+1:03d}{".mp4" if media["kind"] == "video" else ".jpg"}'
-            receipt = target.with_suffix(target.suffix + '.json')
-            if target.exists() and receipt.exists():
-                previous = json.loads(receipt.read_text())
-                with target.open('rb') as stream:
-                    valid = hashlib.file_digest(stream, 'sha256').hexdigest() == previous['sha256']
-                if valid:
-                    total += target.stat().st_size
-                    if total > max_bytes:
-                        raise ValueError('已缓存的媒体超过本次下载大小上限；文件保留')
-                    artifacts.append(previous)
-                    continue
-            media_url = media['url']
-            for redirect in range(5):
-                policy.validate(media_url, frozenset({'cdn-telegram.org', 'telegram.org', 't.me', 'telesco.pe'}))
-                with client.stream('GET', media_url) as response:
-                    if response.is_redirect:
-                        from urllib.parse import urljoin
-                        media_url = urljoin(media_url, response.headers['location'])
-                        continue
-                    response.raise_for_status()
-                    content_type = response.headers.get('content-type', '').split(';')[0]
-                    if not content_type.startswith(('image/', 'video/', 'application/octet-stream')):
-                        raise ValueError('服务器返回非媒体内容')
-                    temporary, count, digest = target.with_suffix(target.suffix + '.part'), 0, hashlib.sha256()
-                    with temporary.open('wb') as stream:
-                        for chunk in response.iter_bytes(256*1024):
-                            count += len(chunk)
-                            if total + count > max_bytes:
-                                raise ValueError('达到本次下载大小上限；保留已完成文件')
-                            stream.write(chunk)
-                            digest.update(chunk)
-                            report_transfer({'filename':str(target),'downloaded_bytes':count,
-                                'total_bytes':int(response.headers.get('content-length') or 0), 'status':'downloading'})
-                    if not count:
-                        raise ValueError('媒体文件为空')
-                    temporary.replace(target)
-                    artifact = {'path':str(target),'sha256':digest.hexdigest(),'size_bytes':count,'media_type':content_type}
-                    receipt.write_text(json.dumps(artifact))
-                    artifacts.append(artifact)
-                    total += count
-                    report_transfer({'filename':str(target),'downloaded_bytes':count,'status':'finished'})
-                    break
-            else:
-                raise ValueError('媒体重定向次数过多')
-    return {'artifacts':artifacts,'items':[post], 'completed':True, 'output_directory':str(folder)}
+    from .public_media_transfer import save_media
+    return save_media(post, folder, max_bytes)

@@ -183,7 +183,8 @@ async def download_media(
 
 @mcp.tool()
 async def discover_public_materials(options: dict[str, Any], checkpoint_key: str | None = None,
-                                    selected_account_url: str | None = None) -> dict[str, Any]:
+                                    selected_account_url: str | None = None,
+                                    review_action: Literal['open', 'check'] | None = None) -> dict[str, Any]:
     """Discover filtered links: fresh anonymous browser, or explicit BitBrowser session.
 
     Telegram public channels always use anonymous standard browsing. This legacy
@@ -195,7 +196,7 @@ async def discover_public_materials(options: dict[str, Any], checkpoint_key: str
     request = DiscoveryInput.model_validate(options)
     registry = runtime().registry if request.browser_engine == 'bitbrowser' else None
     return await asyncio.to_thread(discover, request, runtime().output_root, registry,
-                                  checkpoint_key=checkpoint_key, selected_account_url=selected_account_url)
+                                  checkpoint_key=checkpoint_key, selected_account_url=selected_account_url, review_action=review_action)
 
 
 @mcp.tool()

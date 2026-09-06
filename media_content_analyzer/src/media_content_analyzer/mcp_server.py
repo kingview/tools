@@ -11,6 +11,7 @@ import uuid
 import asyncio
 from pathlib import Path
 from typing import Any
+from mcp.server.fastmcp import Context
 
 
 from .contracts import (
@@ -121,11 +122,28 @@ async def analyze_content(
 
 
 @mcp.tool()
-async def inspect_material(file_path: str) -> dict[str, Any]:
+async def inspect_material(file_path: str, ctx: Context) -> dict[str, Any]:
     """Check, safely repair and recheck one staged image/video for material intake."""
     from .material_inspection import inspect_file, visual_checks
     rt = runtime()
     artifact = rt.artifact(file_path)
+    loop = asyncio.get_running_loop()
+    sequence = 0
+
+    def report(state, issues, actions):
+        nonlocal sequence
+        sequence += 1
+        message = json.dumps({'schema': 'material-inspection/v1', 'state': state,
+                              'issues': issues, 'actions': actions}, ensure_ascii=False)
+        # Inspection runs in a worker thread. MCP emits native notifications on
+        # its owning event loop; no UI or Agent database dependency in the Tool.
+        future = asyncio.run_coroutine_threadsafe(ctx.report_progress(sequence, message=message), loop)
+        try:
+            future.result(timeout=10)
+        except Exception as exc:
+            future.cancel()
+            from .diagnostics import record_exception
+            record_exception('media-content', 'material.inspection-progress', exc)
     def checker(path):
         return visual_checks(path, base_url=os.getenv('SOCIAL_AGENT_LLM_BASE_URL', 'http://127.0.0.1:11434/v1'),
                              model=os.getenv('SOCIAL_AGENT_LLM_MODEL', 'qwen3.5:9b'))
@@ -137,7 +155,7 @@ async def inspect_material(file_path: str) -> dict[str, Any]:
             raise ValueError('视频水印未完成可靠修复')
         return item.processed_artifact.path
     return await asyncio.to_thread(inspect_file, Path(artifact.path), rt.output_root / '.intake-candidates',
-        checker=checker, video_repair=lambda path: asyncio.run(repair(path)))
+        checker=checker, video_repair=lambda path: asyncio.run(repair(path)), on_progress=report)
 
 
 @mcp.tool()

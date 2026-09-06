@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-content-crawler"
-version = "0.9.28"
+version = "0.9.31"
 description = "Contract-first social browsing, downloading, and approved X publishing for local agents"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx>=0.28,<1",
     "imageio-ffmpeg==0.6.0",
     "playwright>=1.58,<2",
     "pydantic>=2.10,<3",

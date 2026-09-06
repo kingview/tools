@@ -56,6 +56,22 @@ class FailingVision:
         raise ConnectionError("Ollama is unavailable")
 
 
+def test_model_control_interruption_does_not_fall_back_to_success(tmp_path):
+    from media_content_analyzer.material_control import MaterialControlInterrupted
+
+    class PausedVision:
+        name = 'paused-fixture'
+        def understand(self, **kwargs):
+            raise MaterialControlInterrupted('paused')
+
+    image = tmp_path / 'test.png'
+    Image.new('RGB', (40, 30), color='white').save(image)
+    backend = LocalMediaAnalysisBackend(ocr_engine=FakeOcr(), transcriber=FakeTranscriber(),
+                                        vision_model=PausedVision())
+    with pytest.raises(MaterialControlInterrupted):
+        backend.analyze(_request(image), [image], tmp_path / 'work')
+
+
 @pytest.mark.parametrize("reference_count", [49, 50, 173])
 def test_dense_image_model_references_fit_tag_contract_without_losing_evidence(tmp_path, reference_count):
     class DenseOcr:
