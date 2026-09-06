@@ -73,10 +73,10 @@ def telegram_rows(page):
 from .discovery_journal import export_links
 
 
-def discover(request: DiscoveryInput, output_root: Path, registry=None):
+def discover(request: DiscoveryInput, output_root: Path, registry=None, *, checkpoint_key=None):
     # Retain the public import path for existing plugin callers.
     from .material_discovery import discover as run
-    return run(request, output_root, registry)
+    return run(request, output_root, registry, checkpoint_key=checkpoint_key)
 
 
 def download_telegram(url: str, output_root: Path, max_bytes=1000*1024*1024):

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 import uuid
+import re
 
 from .browse_backend import (
     _existing_platform_page, _extract_rows, _platform_challenge_visible,
@@ -16,7 +17,7 @@ from .public_materials import telegram_address, telegram_rows
 from .sessions import BitBrowserClient
 from .discovery_runtime import DiscoveryDeadline, BrowserTimeout, wait_for_access
 from .discovery_state import DiscoveryState
-from .discovery_journal import DiscoveryJournal
+from .discovery_journal import DiscoveryJournal,checkpoint_lock
 
 
 def source(request):
@@ -83,16 +84,32 @@ def advance(page, request, address, model, raw):
     return True
 
 
-def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=60):
+def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=60, resume=False, resume_current_page=False):
     address, model = source(request)
     state = DiscoveryState(request)
     deadline = DiscoveryDeadline(page,request.timeout_seconds,clock=clock)
     journal = DiscoveryJournal(folder)
+    restored = resume and journal.load(state)
+    if state.reached_target:
+        return state.result(folder)
     journal.save(state)
     try:
         deadline.check()
-        if not _same_navigation_url(page.url,address):
-            page.goto(address,wait_until='domcontentloaded')
+        initial=address+('?before='+state.cursor if model is None and restored and state.cursor else '')
+        if not resume_current_page and ((restored and model is not None) or not _same_navigation_url(page.url,initial)):
+            page.goto(initial,wait_until='domcontentloaded')
+        if restored and model is not None and not resume_current_page:
+            for _ in range(state.scroll_count):
+                deadline.check()
+                access=wait_for_access(page,request,model.platform,deadline,
+                    validate_login=_raise_if_login_required,challenge_visible=_platform_challenge_visible,
+                    review_wait_seconds=review_wait_seconds)
+                if not access.ready:
+                    state.needs_review,state.reason=True,access.reason
+                    state.warnings.append(access.warning)
+                    return state.result(folder)
+                advance(page,request,address,model,[])
+                deadline.wait(request.access_interval_seconds)
         for _ in range(500):
             deadline.check()
             if model is not None:
@@ -115,9 +132,15 @@ def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=
             journal.save(state)
             if state.reached_target:
                 break
+            if model is not None and state.scroll_count >= 500:
+                state.reason='page_limit'
+                state.warnings.append('已达到本任务 500 次滚动上限，结果已保存；请缩小范围后新建任务。')
+                break
             deadline.check()
             if state.stagnant>=3 or not advance(page,request,address,model,raw):
                 break
+            if model is not None:
+                state.scroll_count+=1
     except BrowserTimeout:
         state.reason='timeout'
         state.warnings.append('已达到运行或页面等待时限；已发现链接已保存，可继续处理这些结果。')
@@ -131,13 +154,33 @@ def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=
     return state.result(folder)
 
 
-def discover(request, output_root, registry=None):
+def discover(request, output_root, registry=None, *, checkpoint_key=None):
     from playwright.sync_api import sync_playwright
-    folder = Path(output_root)/'discovered-links'/uuid.uuid4().hex
-    with sync_playwright() as playwright:
-        with discovery_page(playwright, request, registry) as (page, state):
-            result = collect(page, request, folder)
-            state['keep_for_review'] = result['needs_human_review']
-            if result['needs_human_review'] and request.browser_engine == 'standard':
-                result['warnings'].append('匿名窗口会在本次调用结束后关闭；可改选比特窗口以保留人工处理环境。')
-            return result
+    if checkpoint_key is not None and not re.fullmatch('[a-f0-9]{32}',checkpoint_key):
+        raise ValueError('无效采集检查点 ID')
+    root=Path(output_root).resolve()/'discovered-links'
+    folder=root/(checkpoint_key or uuid.uuid4().hex)
+    if folder.is_symlink() or not folder.resolve().is_relative_to(Path(output_root).resolve()):
+        raise ValueError('采集检查点目录越界')
+    with checkpoint_lock(folder):
+        if checkpoint_key is not None and request.browser_engine == 'standard':
+            from .discovery_sessions import RETAINED_DISCOVERY
+
+            @contextmanager
+            def factory():
+                with sync_playwright() as playwright:
+                    with discovery_page(playwright, request) as (page, _):
+                        yield page
+
+            def operation(page, reused):
+                result = collect(page, request, folder, resume=True, resume_current_page=reused)
+                if result['needs_human_review']:
+                    result['warnings'].append('匿名窗口保留 15 分钟等待人工处理；完成后继续原任务。退出应用或超时后关闭，检查点仍保留。')
+                return result
+
+            return RETAINED_DISCOVERY.run((str(folder.resolve()), DiscoveryState(request).fingerprint()), factory, operation)
+        with sync_playwright() as playwright:
+            with discovery_page(playwright, request, registry) as (page, state):
+                result = collect(page, request, folder, resume=checkpoint_key is not None)
+                state['keep_for_review'] = result['needs_human_review']
+                return result

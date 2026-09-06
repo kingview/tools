@@ -1,6 +1,8 @@
 """Pure filtering, ordering and progress state; independent of browser handles."""
 from dataclasses import dataclass,field
 from datetime import datetime,timezone
+import hashlib
+import json
 
 from .public_materials import accepted
 from .discovery_contract import utc
@@ -25,6 +27,8 @@ class DiscoveryState:
     needs_review: bool = False
     warnings: list = field(default_factory=list)
     cursor: str | None = None
+    scroll_count: int = 0
+    as_of: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def add(self,posts):
         new=0
@@ -33,7 +37,7 @@ class DiscoveryState:
                 self.duplicates+=1
                 continue
             self.seen.add(post['url']); new+=1
-            if accepted(post,self.request): self.selected.append(post)
+            if accepted(post,self.request,now=self.as_of): self.selected.append(post)
             else: self.filtered+=1
         self.stagnant=0 if new else self.stagnant+1
 
@@ -61,6 +65,34 @@ class DiscoveryState:
             output_directory=str(folder),browser_engine=self.request.browser_engine,execution_mode=self.request.execution_mode)
 
     def snapshot(self):
-        return dict(schema_version=1,posts=self.ordered(),seen_urls=sorted(self.seen),
+        return dict(schema_version=2,request_fingerprint=self.fingerprint(),as_of=self.as_of.isoformat(),
+                    scroll_count=self.scroll_count,posts=self.ordered(),seen_urls=sorted(self.seen),
                     duplicates=self.duplicates,filtered=self.filtered,stagnant=self.stagnant,
                     cursor=self.cursor,reason=self.reason,needs_human_review=self.needs_review)
+
+    def fingerprint(self):
+        value=json.dumps(self.request.model_dump(mode='json'),sort_keys=True,separators=(',',':'))
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def restore(self,snapshot):
+        if snapshot.get('schema_version')!=2 or snapshot.get('request_fingerprint')!=self.fingerprint():
+            raise ValueError('采集检查点与原参数不匹配，不能混用其他任务；请新建任务')
+        self.as_of=utc(datetime.fromisoformat(snapshot['as_of']))
+        posts=snapshot['posts']; seen=snapshot['seen_urls']
+        if not isinstance(posts,list) or len(posts)>500 or not isinstance(seen,list) or not all(isinstance(u,str) for u in seen):
+            raise ValueError('采集检查点损坏')
+        for post in posts:
+            if not isinstance(post,dict) or post.get('url') not in seen or not accepted(post,self.request,now=self.as_of):
+                raise ValueError('采集检查点包含无效结果')
+        self.selected=list(posts); self.seen=set(seen)
+        self.cursor=snapshot.get('cursor')
+        if self.cursor is not None and (not isinstance(self.cursor,str) or not self.cursor.isdigit()):
+            raise ValueError('采集游标无效')
+        for key in ('scroll_count','duplicates','filtered'):
+            value=snapshot.get(key,0)
+            if type(value) is not int or value<0 or (key=='scroll_count' and value>500):
+                raise ValueError('采集检查点计数无效')
+            setattr(self,key,value)
+        # A retry receives a new bounded deadline/stagnation allowance. It does
+        # not assume that a previously blocked page has become accessible.
+        self.reason='target_reached' if self.reached_target else 'exhausted'
