@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .diagnostics import current_context, redact
 from .errors import CrawlerError, ErrorCode
+from .material_control import check_material_control, MaterialControlInterrupted
 
 _active = contextvars.ContextVar('transfer_reporter', default=None)
 
@@ -33,6 +34,7 @@ class TransferReporter:
         self.state = {}
 
     def check_active(self):
+        check_material_control()
         if self.policy_path is None:
             return
         try:
@@ -92,7 +94,7 @@ def transfer_scope():
             reporter.report({'status':'preparing'})
         yield
     except Exception as exc:
-        if reporter:
+        if reporter and not isinstance(exc, MaterialControlInterrupted):
             # Report the failure even when cancellation revoked the grant.
             reporter.policy_path = None
             reporter.report({'status':'failed', 'message':str(exc)})
@@ -111,6 +113,7 @@ def report_transfer(event):
 
 
 def check_transfer_active():
+    check_material_control()
     reporter = _active.get()
     if reporter:
         reporter.check_active()

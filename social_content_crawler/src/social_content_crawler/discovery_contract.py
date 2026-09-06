@@ -12,6 +12,7 @@ class DiscoveryInput(BaseModel):
     source: Literal['timeline', 'search', 'user', 'url'] = 'url'
     query: str | None = Field(default=None, max_length=300)
     user_key: str | None = Field(default=None, max_length=300)
+    account_kind: Literal['id', 'name'] = 'id'
     start_url: str | None = None
     sort: Literal['top', 'latest', 'likes'] = 'latest'
     media_type: Literal['both', 'image', 'video'] = 'both'
@@ -63,8 +64,11 @@ class DiscoveryInput(BaseModel):
                 raise ValueError('来源网址与平台不匹配')
         if self.source == 'search' and not (self.query or '').strip():
             raise ValueError('请输入关键词')
-        if self.source == 'user' and self.platform != 'telegram' and not re.fullmatch(r'[A-Za-z0-9_-]+', self.user_key or ''):
-            raise ValueError('请提供明确账号 ID 或改用账号主页 URL；不能擅自选择同名账号')
+        if self.source == 'user' and self.platform != 'telegram':
+            if not (self.user_key or '').strip():
+                raise ValueError('请输入账号名称或 ID')
+            if self.account_kind == 'id' and not re.fullmatch(r'[A-Za-z0-9_-]+', self.user_key or ''):
+                raise ValueError('账号 ID 格式无效；按昵称查找请选择账号名称')
         if self.start_date and self.end_date and utc(self.start_date) > utc(self.end_date):
             raise ValueError('开始时间不能晚于结束时间')
         return self

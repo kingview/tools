@@ -28,6 +28,8 @@ class DiscoveryState:
     warnings: list = field(default_factory=list)
     cursor: str | None = None
     scroll_count: int = 0
+    account_candidates: list = field(default_factory=list)
+    selected_account_url: str | None = None
     as_of: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def add(self,posts):
@@ -62,16 +64,21 @@ class DiscoveryState:
         return dict(posts=posts,count=len(posts),requested=self.request.max_items,found=len(self.seen),
             skipped_duplicates=self.duplicates,filtered_out=self.filtered,completed=self.reached_target,
             needs_human_review=self.needs_review,completion_reason=self.reason,warnings=warnings,
-            output_directory=str(folder),browser_engine=self.request.browser_engine,execution_mode=self.request.execution_mode)
+            output_directory=str(folder),browser_engine=self.request.browser_engine,execution_mode=self.request.execution_mode,
+            account_candidates=self.account_candidates,selected_account_url=self.selected_account_url)
 
     def snapshot(self):
         return dict(schema_version=2,request_fingerprint=self.fingerprint(),as_of=self.as_of.isoformat(),
                     scroll_count=self.scroll_count,posts=self.ordered(),seen_urls=sorted(self.seen),
                     duplicates=self.duplicates,filtered=self.filtered,stagnant=self.stagnant,
-                    cursor=self.cursor,reason=self.reason,needs_human_review=self.needs_review)
+                    cursor=self.cursor,reason=self.reason,needs_human_review=self.needs_review,
+                    account_candidates=self.account_candidates,selected_account_url=self.selected_account_url)
 
     def fingerprint(self):
-        value=json.dumps(self.request.model_dump(mode='json'),sort_keys=True,separators=(',',':'))
+        parameters=self.request.model_dump(mode='json')
+        # Keep pre-account-lookup version-2 checkpoints valid for ID/URL tasks.
+        if parameters.get('account_kind') == 'id': parameters.pop('account_kind',None)
+        value=json.dumps(parameters,sort_keys=True,separators=(',',':'))
         return hashlib.sha256(value.encode()).hexdigest()
 
     def restore(self,snapshot):
@@ -85,6 +92,14 @@ class DiscoveryState:
             if not isinstance(post,dict) or post.get('url') not in seen or not accepted(post,self.request,now=self.as_of):
                 raise ValueError('采集检查点包含无效结果')
         self.selected=list(posts); self.seen=set(seen)
+        from .discovery_accounts import normalize_candidates
+        candidates=snapshot.get('account_candidates',[])
+        if not isinstance(candidates,list) or normalize_candidates(candidates,self.request.platform)!=candidates:
+            raise ValueError('账号候选检查点损坏')
+        self.account_candidates=candidates
+        self.selected_account_url=snapshot.get('selected_account_url')
+        if self.selected_account_url and self.selected_account_url not in {c['url'] for c in candidates}:
+            raise ValueError('已确认账号不在候选列表中')
         self.cursor=snapshot.get('cursor')
         if self.cursor is not None and (not isinstance(self.cursor,str) or not self.cursor.isdigit()):
             raise ValueError('采集游标无效')

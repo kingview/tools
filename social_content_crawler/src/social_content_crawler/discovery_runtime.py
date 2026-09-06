@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from playwright.sync_api import TimeoutError as BrowserTimeout
 from .errors import CrawlerError
+from .material_control import check_material_control
 
 
 class DiscoveryDeadline:
@@ -11,6 +12,7 @@ class DiscoveryDeadline:
         self.ends_at = clock()+seconds
 
     def check(self):
+        check_material_control()
         remaining = self.ends_at-self.clock()
         if remaining<=0:
             raise BrowserTimeout('discovery deadline')
@@ -20,7 +22,11 @@ class DiscoveryDeadline:
         return remaining
 
     def wait(self,seconds):
-        self.page.wait_for_timeout(min(seconds,self.check())*1000)
+        remaining = seconds
+        while remaining > 0:
+            interval=min(remaining,self.check(),.3)
+            self.page.wait_for_timeout(interval*1000)
+            remaining-=interval
         self.check()
 
 
@@ -42,6 +48,7 @@ def wait_for_access(page,request,platform,deadline,*,validate_login,challenge_vi
         page.bring_to_front()
         until=min(deadline.ends_at,deadline.clock()+review_wait_seconds)
         while deadline.clock()<until and challenge_visible(page):
+            deadline.check()
             page.wait_for_timeout(min(500,max(1,(until-deadline.clock())*1000)))
         if challenge_visible(page):
             return AccessResult(False,'manual_review','页面需要人工验证。请在浏览器完成验证后继续，已发现链接会保留。')

@@ -18,6 +18,7 @@ from .sessions import BitBrowserClient
 from .discovery_runtime import DiscoveryDeadline, BrowserTimeout, wait_for_access
 from .discovery_state import DiscoveryState
 from .discovery_journal import DiscoveryJournal,checkpoint_lock
+from .discovery_phases import DiscoveryPhases
 
 
 def source(request):
@@ -84,63 +85,34 @@ def advance(page, request, address, model, raw):
     return True
 
 
-def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=60, resume=False, resume_current_page=False):
+def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=60, resume=False, resume_current_page=False,
+            selected_account_url=None):
     address, model = source(request)
     state = DiscoveryState(request)
     deadline = DiscoveryDeadline(page,request.timeout_seconds,clock=clock)
     journal = DiscoveryJournal(folder)
     restored = resume and journal.load(state)
+
+    def check_access():
+        return wait_for_access(page, request, model.platform, deadline,
+            validate_login=_raise_if_login_required, challenge_visible=_platform_challenge_visible,
+            review_wait_seconds=review_wait_seconds)
+
+    def read_rows():
+        return (telegram_rows(page) if model is None else
+            [post.model_dump(mode='json') for post in normalize_rows(model.platform, _extract_rows(page, model), 500)])
+
+    phases = DiscoveryPhases(page, request, state, deadline, address, model, check_access, read_rows,
+                             lambda address, raw: advance(page, request, address, model, raw))
+    phases.confirm_account(selected_account_url)
     if state.reached_target:
         return state.result(folder)
     journal.save(state)
     try:
         deadline.check()
-        initial=address+('?before='+state.cursor if model is None and restored and state.cursor else '')
-        if not resume_current_page and ((restored and model is not None) or not _same_navigation_url(page.url,initial)):
-            page.goto(initial,wait_until='domcontentloaded')
-        if restored and model is not None and not resume_current_page:
-            for _ in range(state.scroll_count):
-                deadline.check()
-                access=wait_for_access(page,request,model.platform,deadline,
-                    validate_login=_raise_if_login_required,challenge_visible=_platform_challenge_visible,
-                    review_wait_seconds=review_wait_seconds)
-                if not access.ready:
-                    state.needs_review,state.reason=True,access.reason
-                    state.warnings.append(access.warning)
-                    return state.result(folder)
-                advance(page,request,address,model,[])
-                deadline.wait(request.access_interval_seconds)
-        for _ in range(500):
-            deadline.check()
-            if model is not None:
-                access = wait_for_access(page,request,model.platform,deadline,
-                    validate_login=_raise_if_login_required,challenge_visible=_platform_challenge_visible,
-                    review_wait_seconds=review_wait_seconds)
-                if not access.ready:
-                    state.needs_review,state.reason = True,access.reason
-                    state.warnings.append(access.warning)
-                    break
-            deadline.wait(request.access_interval_seconds)
-            raw = (telegram_rows(page) if model is None else
-                [post.model_dump(mode='json') for post in normalize_rows(model.platform,_extract_rows(page,model),500)])
-            state.add(raw)
-            if model is None:
-                ids=[int(p['post_id']) for p in raw if str(p.get('post_id','')).isdigit()]
-                state.cursor=str(min(ids)) if ids else None
-            if state.reached_target:
-                state.reason='target_reached'
-            journal.save(state)
-            if state.reached_target:
-                break
-            if model is not None and state.scroll_count >= 500:
-                state.reason='page_limit'
-                state.warnings.append('已达到本任务 500 次滚动上限，结果已保存；请缩小范围后新建任务。')
-                break
-            deadline.check()
-            if state.stagnant>=3 or not advance(page,request,address,model,raw):
-                break
-            if model is not None:
-                state.scroll_count+=1
+        if (phases.prepare_account()
+                and phases.restore_position(restored=restored, current_page=resume_current_page)):
+            phases.collect_pages(journal)
     except BrowserTimeout:
         state.reason='timeout'
         state.warnings.append('已达到运行或页面等待时限；已发现链接已保存，可继续处理这些结果。')
@@ -154,7 +126,7 @@ def collect(page, request, folder, *, clock=time.monotonic, review_wait_seconds=
     return state.result(folder)
 
 
-def discover(request, output_root, registry=None, *, checkpoint_key=None):
+def discover(request, output_root, registry=None, *, checkpoint_key=None, selected_account_url=None):
     from playwright.sync_api import sync_playwright
     if checkpoint_key is not None and not re.fullmatch('[a-f0-9]{32}',checkpoint_key):
         raise ValueError('无效采集检查点 ID')
@@ -165,22 +137,26 @@ def discover(request, output_root, registry=None, *, checkpoint_key=None):
     with checkpoint_lock(folder):
         if checkpoint_key is not None and request.browser_engine == 'standard':
             from .discovery_sessions import RETAINED_DISCOVERY
+            from .discovery_profiles import profile_directory, persistent_page
+            profile = profile_directory(checkpoint_key, DiscoveryState(request).fingerprint())
 
             @contextmanager
             def factory():
                 with sync_playwright() as playwright:
-                    with discovery_page(playwright, request) as (page, _):
+                    with persistent_page(playwright, profile) as page:
                         yield page
 
             def operation(page, reused):
-                result = collect(page, request, folder, resume=True, resume_current_page=reused)
+                result = collect(page, request, folder, resume=True, resume_current_page=reused,
+                                 selected_account_url=selected_account_url)
                 if result['needs_human_review']:
-                    result['warnings'].append('匿名窗口保留 15 分钟等待人工处理；完成后继续原任务。退出应用或超时后关闭，检查点仍保留。')
+                    result['warnings'].append('任务专属标准窗口保留 15 分钟；浏览器配置与检查点保存在本机，重启后可继续原任务，不复用其他窗口。')
                 return result
 
             return RETAINED_DISCOVERY.run((str(folder.resolve()), DiscoveryState(request).fingerprint()), factory, operation)
         with sync_playwright() as playwright:
             with discovery_page(playwright, request, registry) as (page, state):
-                result = collect(page, request, folder, resume=checkpoint_key is not None)
+                result = collect(page, request, folder, resume=checkpoint_key is not None,
+                                 selected_account_url=selected_account_url)
                 state['keep_for_review'] = result['needs_human_review']
                 return result
